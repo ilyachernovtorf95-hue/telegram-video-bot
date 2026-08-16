@@ -1,0 +1,2 @@
+requests>=2.32,<3
+yt-dlp[default]>=2025.1.1

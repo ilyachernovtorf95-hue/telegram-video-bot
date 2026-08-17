@@ -1,22 +1,21 @@
-import os
-import re
-import time
 import json
 import mimetypes
+import os
+import re
 import tempfile
+import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 import yt_dlp
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-MAX_TELEGRAM_VIDEO_BYTES = 49 * 1024 * 1024  # keep a little under Telegram's 50 MB sendVideo limit
+MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
 
 
 def tg(method: str, *, data=None, files=None, params=None, timeout=90):
@@ -91,7 +90,6 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         title = clean_title(info.get("title"))
-        prepared = Path(ydl.prepare_filename(info))
 
     candidates = sorted(
         [p for p in Path(tmpdir).iterdir() if p.is_file()],
@@ -101,7 +99,6 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
     if not candidates:
         raise RuntimeError("Downloaded file was not found")
 
-    # Prefer the final merged MP4 when present.
     mp4s = [p for p in candidates if p.suffix.lower() == ".mp4"]
     return (mp4s[0] if mp4s else candidates[0]), title
 
@@ -117,16 +114,16 @@ def handle_message(message: dict):
         send_message(
             chat_id,
             "Пришли ссылку на видео. Я попробую скачать ролик и отправить его обратно в Telegram.\n\n"
-            "Работает не со всеми сайтами: некоторые требуют вход, cookies или блокируют скачивание.",
+            "Некоторые сайты требуют вход, cookies или блокируют скачивание.",
         )
         return
 
     match = URL_RE.search(text)
     if not match:
-        send_message(chat_id, "Пришли обычную ссылку, начинающуюся с http:// или https://")
+        send_message(chat_id, "Пришли ссылку, начинающуюся с http:// или https://")
         return
 
-    url = match.group(0)
+    url = match.group(0).rstrip(".,;!?)\"]}")
     status = send_message(chat_id, "⏳ Скачиваю видео…")
     status_id = status["message_id"]
 
@@ -143,8 +140,8 @@ def handle_message(message: dict):
                         "chat_id": chat_id,
                         "message_id": status_id,
                         "text": (
-                            f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ. "
-                            "Обычный Telegram Bot API не отправляет video-файлы больше 50 МБ."
+                            f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ, "
+                            "поэтому бот не может отправить его текущим способом."
                         ),
                     },
                 )
@@ -155,7 +152,10 @@ def handle_message(message: dict):
             else:
                 send_document(chat_id, path, title)
 
-        tg("deleteMessage", data={"chat_id": chat_id, "message_id": status_id})
+        try:
+            tg("deleteMessage", data={"chat_id": chat_id, "message_id": status_id})
+        except Exception:
+            pass
     except Exception as exc:
         print("ERROR:", repr(exc), flush=True)
         try:
@@ -176,9 +176,11 @@ def handle_message(message: dict):
 
 
 def main():
-    print("Telegram video bot started", flush=True)
-    offset = None
+    me = tg("getMe", timeout=30)
+    tg("deleteWebhook", data={"drop_pending_updates": "false"}, timeout=30)
+    print(f"Telegram video bot started as @{me.get('username', 'unknown')}", flush=True)
 
+    offset = None
     while True:
         try:
             params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}

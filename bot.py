@@ -179,25 +179,25 @@ def safe_name(text):
 
 def note_file(tmpdir,title,url,p,summary,transcript):
     path=Path(tmpdir)/f"{safe_name(title)}.md"
-    path.write_text(f"# {title}\n\n- Источник: {p}\n- Ссылка: {url}\n- Создано: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime())}\n\n## Выжимка\n\n{summary}\n\n## Полная транскрипция\n\n{transcript}\n",encoding="utf-8")
+    path.write_text(f"# {title}\n\n- Источник: {p}\n- Ссылка: {url}\n- Создано: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime())}\n\n## Смысловая выжимка\n\n{summary}\n\n## Автоматическая транскрипция\n\n{transcript}\n",encoding="utf-8")
     return path
 
 
 def local_pipeline(chat_id,mid,path,tmpdir,title,url,p):
-    edit(chat_id,mid,f"🧠 {p}: локально распознаю речь (без OpenAI API)…")
-    transcript=transcribe(path)
-    edit(chat_id,mid,f"✨ {p}: делаю локальную выжимку…")
-    summary=summarize(transcript)
+    edit(chat_id,mid,f"🧠 {p}: распознаю речь улучшенной локальной моделью…")
+    transcript=transcribe(path, hint=title)
+    edit(chat_id,mid,f"✨ {p}: делаю смысловую выжимку локальной LLM…")
+    summary=summarize(transcript, title=title)
     send_long(chat_id,f"📝 {title}\n\n{summary}")
     note=note_file(tmpdir,title,url,p,summary,transcript)
-    send_doc(chat_id,note,"📚 Obsidian-ready заметка: выжимка + полная транскрипция")
+    send_doc(chat_id,note,"📚 Obsidian-ready заметка: смысловая выжимка + транскрипция")
 
 
 def handle(message):
     chat_id=(message.get("chat") or {}).get("id"); text=(message.get("text") or "").strip()
     if not chat_id: return
     if text.startswith(("/start","/help")):
-        send(chat_id,"Пришли ссылку на видео. Скачаю медиа, локально распознаю речь через Whisper, сделаю выжимку и .md заметку для Obsidian. OpenAI API не используется."); return
+        send(chat_id,"Пришли ссылку на видео. Скачаю медиа, локально распознаю речь улучшенным Whisper и сделаю смысловую выжимку локальной LLM. OpenAI API не используется."); return
     m=URL_RE.search(text)
     if not m: send(chat_id,"Пришли ссылку, начинающуюся с http:// или https://"); return
     url=m.group(0).rstrip(".,;!?)\"]}"); p=platform(url); status=send(chat_id,f"⏳ {p}: скачиваю медиа…"); mid=status["message_id"]
@@ -227,7 +227,7 @@ def handle(message):
 def main():
     me=tg("getMe",timeout=30); tg("deleteWebhook",data={"drop_pending_updates":"false"},timeout=30)
     print(f"Telegram video bot started as @{me.get('username','unknown')}",flush=True)
-    print(f"yt-dlp: {yt_dlp.version.__version__}; local Whisper enabled",flush=True)
+    print(f"yt-dlp: {yt_dlp.version.__version__}; whisper.cpp + local LLM enabled",flush=True)
     offset=None
     while True:
         try:

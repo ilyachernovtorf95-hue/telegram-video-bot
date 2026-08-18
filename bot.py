@@ -19,7 +19,7 @@ if ":" not in TOKEN:
 API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
-TARGET_VIDEO_BYTES = min(MAX_TELEGRAM_VIDEO_BYTES - 2 * 1024 * 1024, 47 * 1024 * 1024)
+SAFE_PART_BYTES = min(MAX_TELEGRAM_VIDEO_BYTES - 3 * 1024 * 1024, 46 * 1024 * 1024)
 
 
 def redact_secret(text: str) -> str:
@@ -42,6 +42,10 @@ def send_message(chat_id: int, text: str):
     return tg("sendMessage", data={"chat_id": chat_id, "text": text})
 
 
+def edit_message(chat_id: int, message_id: int, text: str):
+    return tg("editMessageText", data={"chat_id": chat_id, "message_id": message_id, "text": text})
+
+
 def send_chat_action(chat_id: int, action: str):
     try:
         tg("sendChatAction", data={"chat_id": chat_id, "action": action}, timeout=20)
@@ -55,7 +59,7 @@ def send_video(chat_id: int, path: Path, caption: str = ""):
             "sendVideo",
             data={"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"},
             files={"video": (path.name, fh, "video/mp4")},
-            timeout=300,
+            timeout=600,
         )
 
 
@@ -66,7 +70,7 @@ def send_document(chat_id: int, path: Path, caption: str = ""):
             "sendDocument",
             data={"chat_id": chat_id, "caption": caption[:1024]},
             files={"document": (path.name, fh, mime)},
-            timeout=300,
+            timeout=600,
         )
 
 
@@ -76,7 +80,16 @@ def clean_title(title: str) -> str:
 
 def ytdlp_options(tmpdir: str, player_client: str) -> dict:
     return {
-        "format": "bv*[height<=720]+ba/b[height<=720]/best",
+        # Prefer a single, reasonably small progressive stream. This avoids downloading
+        # huge 720p files only to spend many minutes transcoding them afterwards.
+        "format": (
+            "best[ext=mp4][filesize<=46M]/"
+            "best[filesize<=46M]/"
+            "best[ext=mp4][height<=480]/"
+            "best[height<=480]/"
+            "best[ext=mp4][height<=360]/"
+            "best[height<=360]/best"
+        ),
         "outtmpl": str(Path(tmpdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": False,
@@ -84,11 +97,12 @@ def ytdlp_options(tmpdir: str, player_client: str) -> dict:
         "verbose": True,
         "restrictfilenames": True,
         "merge_output_format": "mp4",
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 3,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
         "socket_timeout": 30,
-        "concurrent_fragment_downloads": 1,
+        "concurrent_fragment_downloads": 4,
+        "http_chunk_size": 10 * 1024 * 1024,
         "js_runtimes": {"node": {"path": "/usr/local/bin/node"}},
         "extractor_args": {
             "youtube": {"player_client": [player_client]},
@@ -131,14 +145,9 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
 
 def probe_duration(path: Path) -> float:
     result = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, check=True, timeout=30,
     )
     duration = float(result.stdout.strip())
     if duration <= 0:
@@ -146,64 +155,35 @@ def probe_duration(path: Path) -> float:
     return duration
 
 
-def compress_for_telegram(path: Path, tmpdir: str) -> Path:
-    if path.stat().st_size <= MAX_TELEGRAM_VIDEO_BYTES:
-        return path
+def split_for_telegram(path: Path, tmpdir: str) -> list[Path]:
+    """Fast path for large files: split on keyframes without re-encoding."""
+    size = path.stat().st_size
+    if size <= MAX_TELEGRAM_VIDEO_BYTES:
+        return [path]
 
     duration = probe_duration(path)
-    target_bytes = TARGET_VIDEO_BYTES
-    audio_bps = 96_000 if duration < 3600 else 64_000
-    total_bps = max(300_000, int((target_bytes * 8 / duration) * 0.92))
-    video_bps = max(180_000, total_bps - audio_bps)
+    # 82% safety margin handles variable bitrate and keyframe-aligned cuts.
+    segment_seconds = max(30, int(duration * SAFE_PART_BYTES / size * 0.82))
+    pattern = str(Path(tmpdir) / "telegram-part-%03d.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(path),
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        "-f", "segment", "-segment_time", str(segment_seconds),
+        "-reset_timestamps", "1", "-movflags", "+faststart", pattern,
+    ]
+    print(f"FAST_SPLIT size={size / 1024 / 1024:.1f}MB segment={segment_seconds}s", flush=True)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
+    parts = sorted(Path(tmpdir).glob("telegram-part-*.mp4"))
+    if not parts:
+        raise RuntimeError("Video splitting produced no files")
 
-    if video_bps >= 1_000_000:
-        max_height = 720
-    elif video_bps >= 550_000:
-        max_height = 480
-    else:
-        max_height = 360
-
-    output = Path(tmpdir) / "telegram-compressed.mp4"
-
-    for attempt in range(3):
-        if output.exists():
-            output.unlink()
-
-        maxrate = int(video_bps * 1.15)
-        bufsize = int(video_bps * 2)
-        print(
-            f"COMPRESS_ATTEMPT={attempt + 1} duration={duration:.1f}s "
-            f"video_bps={video_bps} audio_bps={audio_bps} height={max_height}",
-            flush=True,
+    oversized = [p for p in parts if p.stat().st_size > MAX_TELEGRAM_VIDEO_BYTES]
+    if oversized:
+        raise RuntimeError(
+            "A split part is still too large; retry with a lower source quality"
         )
-
-        cmd = [
-            "ffmpeg", "-y", "-i", str(path),
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-vf", f"scale=-2:'min({max_height},ih)'",
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-b:v", str(video_bps),
-            "-maxrate", str(maxrate),
-            "-bufsize", str(bufsize),
-            "-c:a", "aac", "-b:a", str(audio_bps),
-            "-movflags", "+faststart",
-            str(output),
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
-
-        size = output.stat().st_size
-        print(f"COMPRESS_RESULT size={size / 1024 / 1024:.1f}MB", flush=True)
-        if size <= MAX_TELEGRAM_VIDEO_BYTES:
-            return output
-
-        ratio = target_bytes / size
-        video_bps = max(150_000, int(video_bps * ratio * 0.90))
-        if video_bps < 500_000:
-            max_height = min(max_height, 360)
-
-    raise RuntimeError(
-        f"Could not compress video below {MAX_TELEGRAM_VIDEO_BYTES / 1024 / 1024:.0f} MB"
-    )
+    print("FAST_SPLIT_RESULT " + ", ".join(f"{p.stat().st_size/1024/1024:.1f}MB" for p in parts), flush=True)
+    return parts
 
 
 def safe_error_text(exc: Exception) -> str:
@@ -218,7 +198,7 @@ def handle_message(message: dict):
         return
 
     if text.startswith("/start") or text.startswith("/help"):
-        send_message(chat_id, "Пришли ссылку на видео. Я попробую скачать ролик и отправить его обратно в Telegram.")
+        send_message(chat_id, "Пришли ссылку на видео. Я скачаю ролик и отправлю его обратно в Telegram.")
         return
 
     match = URL_RE.search(text)
@@ -231,30 +211,34 @@ def handle_message(message: dict):
     status_id = status["message_id"]
 
     try:
-        send_chat_action(chat_id, "upload_video")
         with tempfile.TemporaryDirectory(prefix="tg-video-") as tmpdir:
             path, title = download_with_ytdlp(url, tmpdir)
             original_size = path.stat().st_size
 
             if original_size > MAX_TELEGRAM_VIDEO_BYTES:
-                tg(
-                    "editMessageText",
-                    data={
-                        "chat_id": chat_id,
-                        "message_id": status_id,
-                        "text": (
-                            f"⏳ Видео скачалось ({original_size / 1024 / 1024:.1f} МБ). "
-                            "Сжимаю до размера для Telegram…"
-                        ),
-                    },
+                edit_message(
+                    chat_id, status_id,
+                    f"⚡ Видео скачалось ({original_size / 1024 / 1024:.1f} МБ). "
+                    "Быстро делю на части без перекодирования…",
                 )
-                path = compress_for_telegram(path, tmpdir)
-
-            send_chat_action(chat_id, "upload_video")
-            if path.suffix.lower() == ".mp4":
-                send_video(chat_id, path, title)
+                parts = split_for_telegram(path, tmpdir)
             else:
-                send_document(chat_id, path, title)
+                parts = [path]
+
+            total = len(parts)
+            for index, part in enumerate(parts, 1):
+                send_chat_action(chat_id, "upload_video")
+                if total > 1:
+                    edit_message(chat_id, status_id, f"📤 Отправляю часть {index}/{total}…")
+                    caption = f"{title}\nЧасть {index}/{total}"
+                else:
+                    edit_message(chat_id, status_id, "📤 Отправляю видео…")
+                    caption = title
+
+                if part.suffix.lower() == ".mp4":
+                    send_video(chat_id, part, caption)
+                else:
+                    send_document(chat_id, part, caption)
 
         try:
             tg("deleteMessage", data={"chat_id": chat_id, "message_id": status_id})
@@ -264,14 +248,7 @@ def handle_message(message: dict):
         print("DOWNLOAD_ERROR:", safe_error_text(exc), flush=True)
         error_text = safe_error_text(exc)
         try:
-            tg(
-                "editMessageText",
-                data={
-                    "chat_id": chat_id,
-                    "message_id": status_id,
-                    "text": f"❌ Не получилось скачать или подготовить видео.\n\nТехническая причина:\n{error_text}",
-                },
-            )
+            edit_message(chat_id, status_id, f"❌ Не получилось скачать или подготовить видео.\n\nТехническая причина:\n{error_text}")
         except Exception:
             send_message(chat_id, "❌ Ошибка при обработке ссылки.")
 

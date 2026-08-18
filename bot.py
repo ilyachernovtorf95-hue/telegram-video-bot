@@ -2,6 +2,7 @@ import json
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ if ":" not in TOKEN:
 API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
+TARGET_VIDEO_BYTES = min(MAX_TELEGRAM_VIDEO_BYTES - 2 * 1024 * 1024, 47 * 1024 * 1024)
 
 
 def redact_secret(text: str) -> str:
@@ -53,7 +55,7 @@ def send_video(chat_id: int, path: Path, caption: str = ""):
             "sendVideo",
             data={"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"},
             files={"video": (path.name, fh, "video/mp4")},
-            timeout=240,
+            timeout=300,
         )
 
 
@@ -64,7 +66,7 @@ def send_document(chat_id: int, path: Path, caption: str = ""):
             "sendDocument",
             data={"chat_id": chat_id, "caption": caption[:1024]},
             files={"document": (path.name, fh, mime)},
-            timeout=240,
+            timeout=300,
         )
 
 
@@ -73,8 +75,6 @@ def clean_title(title: str) -> str:
 
 
 def ytdlp_options(tmpdir: str, player_client: str) -> dict:
-    # Do not force mp4+m4a here: web_safari often exposes HLS formats only.
-    # yt-dlp + ffmpeg will merge/transcode container metadata when needed.
     return {
         "format": "bv*[height<=720]+ba/b[height<=720]/best",
         "outtmpl": str(Path(tmpdir) / "%(title).80s-%(id)s.%(ext)s"),
@@ -92,7 +92,6 @@ def ytdlp_options(tmpdir: str, player_client: str) -> dict:
         "js_runtimes": {"node": {"path": "/usr/local/bin/node"}},
         "extractor_args": {
             "youtube": {"player_client": [player_client]},
-            # HTTP provider is started by Docker on the default 127.0.0.1:4416.
             "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
         },
     }
@@ -100,8 +99,6 @@ def ytdlp_options(tmpdir: str, player_client: str) -> dict:
 
 def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
     errors = []
-    # mweb + PO token is the primary path. web_safari can expose HLS streams
-    # that currently do not require a GVS PO token. android_vr is a final fallback.
     for player_client in ("mweb", "web_safari", "android_vr"):
         try:
             print(f"DOWNLOAD_ATTEMPT player_client={player_client}", flush=True)
@@ -132,6 +129,83 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
     raise RuntimeError(" | ".join(errors))
 
 
+def probe_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    duration = float(result.stdout.strip())
+    if duration <= 0:
+        raise RuntimeError("Could not determine video duration")
+    return duration
+
+
+def compress_for_telegram(path: Path, tmpdir: str) -> Path:
+    if path.stat().st_size <= MAX_TELEGRAM_VIDEO_BYTES:
+        return path
+
+    duration = probe_duration(path)
+    target_bytes = TARGET_VIDEO_BYTES
+    audio_bps = 96_000 if duration < 3600 else 64_000
+    total_bps = max(300_000, int((target_bytes * 8 / duration) * 0.92))
+    video_bps = max(180_000, total_bps - audio_bps)
+
+    if video_bps >= 1_000_000:
+        max_height = 720
+    elif video_bps >= 550_000:
+        max_height = 480
+    else:
+        max_height = 360
+
+    output = Path(tmpdir) / "telegram-compressed.mp4"
+
+    for attempt in range(3):
+        if output.exists():
+            output.unlink()
+
+        maxrate = int(video_bps * 1.15)
+        bufsize = int(video_bps * 2)
+        print(
+            f"COMPRESS_ATTEMPT={attempt + 1} duration={duration:.1f}s "
+            f"video_bps={video_bps} audio_bps={audio_bps} height={max_height}",
+            flush=True,
+        )
+
+        cmd = [
+            "ffmpeg", "-y", "-i", str(path),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", f"scale=-2:'min({max_height},ih)'",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", str(video_bps),
+            "-maxrate", str(maxrate),
+            "-bufsize", str(bufsize),
+            "-c:a", "aac", "-b:a", str(audio_bps),
+            "-movflags", "+faststart",
+            str(output),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+
+        size = output.stat().st_size
+        print(f"COMPRESS_RESULT size={size / 1024 / 1024:.1f}MB", flush=True)
+        if size <= MAX_TELEGRAM_VIDEO_BYTES:
+            return output
+
+        ratio = target_bytes / size
+        video_bps = max(150_000, int(video_bps * ratio * 0.90))
+        if video_bps < 500_000:
+            max_height = min(max_height, 360)
+
+    raise RuntimeError(
+        f"Could not compress video below {MAX_TELEGRAM_VIDEO_BYTES / 1024 / 1024:.0f} MB"
+    )
+
+
 def safe_error_text(exc: Exception) -> str:
     text = re.sub(r"\s+", " ", redact_secret(exc)).strip()
     return text[-700:] if text else type(exc).__name__
@@ -160,19 +234,23 @@ def handle_message(message: dict):
         send_chat_action(chat_id, "upload_video")
         with tempfile.TemporaryDirectory(prefix="tg-video-") as tmpdir:
             path, title = download_with_ytdlp(url, tmpdir)
-            size = path.stat().st_size
+            original_size = path.stat().st_size
 
-            if size > MAX_TELEGRAM_VIDEO_BYTES:
+            if original_size > MAX_TELEGRAM_VIDEO_BYTES:
                 tg(
                     "editMessageText",
                     data={
                         "chat_id": chat_id,
                         "message_id": status_id,
-                        "text": f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ. Нужна версия меньшего размера.",
+                        "text": (
+                            f"⏳ Видео скачалось ({original_size / 1024 / 1024:.1f} МБ). "
+                            "Сжимаю до размера для Telegram…"
+                        ),
                     },
                 )
-                return
+                path = compress_for_telegram(path, tmpdir)
 
+            send_chat_action(chat_id, "upload_video")
             if path.suffix.lower() == ".mp4":
                 send_video(chat_id, path, title)
             else:
@@ -191,7 +269,7 @@ def handle_message(message: dict):
                 data={
                     "chat_id": chat_id,
                     "message_id": status_id,
-                    "text": f"❌ Не получилось скачать видео.\n\nТехническая причина:\n{error_text}",
+                    "text": f"❌ Не получилось скачать или подготовить видео.\n\nТехническая причина:\n{error_text}",
                 },
             )
         except Exception:

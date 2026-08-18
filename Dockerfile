@@ -28,8 +28,8 @@ RUN mkdir -p /models \
       -o /models/ggml-small-q5_1.bin \
       https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin?download=true \
     && curl -L --fail --retry 4 --retry-delay 3 \
-      -o /models/Qwen3-0.6B-Q4_K_M.gguf \
-      https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen_Qwen3-0.6B-Q4_K_M.gguf?download=true
+      -o /models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+      https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true
 
 FROM python:3.12-slim
 
@@ -51,7 +51,7 @@ COPY bot.py local_ai.py ./
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium
 ENV WHISPER_CPP_MODEL=/opt/models/ggml-small-q5_1.bin
-ENV LOCAL_LLM_MODEL=/opt/models/Qwen3-0.6B-Q4_K_M.gguf
+ENV LOCAL_LLM_MODEL=/opt/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ENV LOCAL_AI_THREADS=2
 
 CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec python bot.py"]

@@ -18,6 +18,7 @@ if ":" not in TOKEN:
 API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
+POT_SCRIPT = "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
 
 
 def tg(method: str, *, data=None, files=None, params=None, timeout=90):
@@ -81,13 +82,18 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "restrictfilenames": True,
         "merge_output_format": "mp4",
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        "js_runtimes": {"node": {"path": "/usr/local/bin/node"}},
+        "extractor_args": {
+            "youtube": {"player_client": ["mweb"]},
+            "youtubepot-bgutilscript": {"script_path": [POT_SCRIPT]},
+        },
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -159,7 +165,7 @@ def handle_message(message: dict):
         except Exception:
             pass
     except Exception as exc:
-        print("ERROR:", repr(exc), flush=True)
+        print("DOWNLOAD_ERROR:", repr(exc), flush=True)
         try:
             tg(
                 "editMessageText",
@@ -168,8 +174,7 @@ def handle_message(message: dict):
                     "message_id": status_id,
                     "text": (
                         "❌ Не получилось скачать или отправить это видео. "
-                        "Возможно, сайт требует авторизацию, блокирует скачивание "
-                        "или ссылка не поддерживается."
+                        "Я уже записал техническую ошибку в лог для диагностики."
                     ),
                 },
             )
@@ -181,6 +186,8 @@ def main():
     me = tg("getMe", timeout=30)
     tg("deleteWebhook", data={"drop_pending_updates": "false"}, timeout=30)
     print(f"Telegram video bot started as @{me.get('username', 'unknown')}", flush=True)
+    print(f"yt-dlp version: {yt_dlp.version.__version__}", flush=True)
+    print(f"PO token script exists: {Path(POT_SCRIPT).exists()}", flush=True)
 
     offset = None
     while True:

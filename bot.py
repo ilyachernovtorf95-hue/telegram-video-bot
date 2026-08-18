@@ -1,3 +1,4 @@
+import html
 import json
 import mimetypes
 import os
@@ -6,6 +7,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import yt_dlp
@@ -20,6 +22,10 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
 SAFE_PART_BYTES = min(MAX_TELEGRAM_VIDEO_BYTES - 3 * 1024 * 1024, 46 * 1024 * 1024)
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 
 def redact_secret(text: str) -> str:
@@ -53,8 +59,18 @@ def send_chat_action(chat_id: int, action: str):
         pass
 
 
+def send_photo(chat_id: int, path: Path, caption: str = ""):
+    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    with path.open("rb") as fh:
+        return tg(
+            "sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:1024]},
+            files={"photo": (path.name, fh, mime)},
+            timeout=300,
+        )
+
+
 def probe_video_metadata(path: Path) -> tuple[int, int, int]:
-    """Return width, height and duration for Telegram sendVideo metadata."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -111,8 +127,23 @@ def clean_title(title: str) -> str:
     return re.sub(r"\s+", " ", title or "Видео").strip()
 
 
-def ytdlp_options(tmpdir: str, player_client: str) -> dict:
-    return {
+def detect_platform(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host in {"youtu.be", "youtube.com", "m.youtube.com", "music.youtube.com"} or host.endswith(".youtube.com"):
+        return "YouTube"
+    if host == "vk.com" or host.endswith(".vk.com") or host == "vkvideo.ru" or host.endswith(".vkvideo.ru"):
+        return "VK"
+    if host == "tiktok.com" or host.endswith(".tiktok.com") or host == "vm.tiktok.com":
+        return "TikTok"
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return "Instagram"
+    if host == "threads.net" or host.endswith(".threads.net") or host == "threads.com" or host.endswith(".threads.com"):
+        return "Threads"
+    return "сайт"
+
+
+def ytdlp_options(tmpdir: str, player_client: str | None = None) -> dict:
+    options = {
         "format": (
             "best[ext=mp4][filesize<=46M]/"
             "best[filesize<=46M]/"
@@ -134,34 +165,85 @@ def ytdlp_options(tmpdir: str, player_client: str) -> dict:
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 4,
         "http_chunk_size": 10 * 1024 * 1024,
+        "http_headers": {"User-Agent": USER_AGENT},
         "js_runtimes": {"node": {"path": "/usr/local/bin/node"}},
-        "extractor_args": {
+    }
+    if player_client:
+        options["extractor_args"] = {
             "youtube": {"player_client": [player_client]},
             "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
-        },
-    }
+        }
+    return options
+
+
+def newest_download(tmpdir: str) -> Path:
+    candidates = sorted(
+        [
+            p for p in Path(tmpdir).iterdir()
+            if p.is_file() and not p.name.endswith((".part", ".ytdl"))
+        ],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise RuntimeError("Downloaded file was not found")
+    mp4s = [p for p in candidates if p.suffix.lower() == ".mp4"]
+    return mp4s[0] if mp4s else candidates[0]
+
+
+def download_direct_meta(url: str, tmpdir: str) -> tuple[Path, str]:
+    """Fallback for public Instagram/Threads pages exposing og:video/og:image."""
+    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30, allow_redirects=True)
+    response.raise_for_status()
+    body = response.text
+
+    def find_meta(prop: str) -> str | None:
+        patterns = [
+            rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)',
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']{re.escape(prop)}["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, body, re.IGNORECASE)
+            if match:
+                return html.unescape(match.group(1))
+        return None
+
+    media_url = find_meta("og:video") or find_meta("og:video:secure_url") or find_meta("og:image")
+    if not media_url:
+        raise RuntimeError("Public page does not expose downloadable media metadata")
+    title = clean_title(find_meta("og:title") or "Media")
+    media = requests.get(media_url, headers={"User-Agent": USER_AGENT, "Referer": url}, timeout=90, stream=True)
+    media.raise_for_status()
+    content_type = (media.headers.get("content-type") or "").split(";", 1)[0].lower()
+    suffix = mimetypes.guess_extension(content_type) or (".mp4" if "video" in content_type else ".jpg")
+    path = Path(tmpdir) / f"direct-media{suffix}"
+    with path.open("wb") as fh:
+        for chunk in media.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                fh.write(chunk)
+    return path, title
 
 
 def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
+    platform = detect_platform(url)
     errors = []
-    for player_client in ("mweb", "web_safari", "android_vr"):
+
+    if platform == "YouTube":
+        attempts: list[str | None] = ["mweb", "web_safari", "android_vr"]
+    else:
+        attempts = [None]
+
+    for player_client in attempts:
         try:
-            print(f"DOWNLOAD_ATTEMPT player_client={player_client}", flush=True)
+            label = player_client or "generic"
+            print(f"DOWNLOAD_ATTEMPT platform={platform} client={label}", flush=True)
             with yt_dlp.YoutubeDL(ytdlp_options(tmpdir, player_client)) as ydl:
                 info = ydl.extract_info(url, download=True)
                 title = clean_title(info.get("title"))
-
-            candidates = sorted(
-                [p for p in Path(tmpdir).iterdir() if p.is_file() and not p.name.endswith(".part")],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if not candidates:
-                raise RuntimeError("Downloaded file was not found")
-            mp4s = [p for p in candidates if p.suffix.lower() == ".mp4"]
-            return (mp4s[0] if mp4s else candidates[0]), title
+            return newest_download(tmpdir), title
         except Exception as exc:
-            message = f"{player_client}: {type(exc).__name__}: {redact_secret(exc)}"
+            label = player_client or "generic"
+            message = f"{platform}/{label}: {type(exc).__name__}: {redact_secret(exc)}"
             errors.append(message)
             print("DOWNLOAD_ATTEMPT_FAILED:", message, flush=True)
             for p in Path(tmpdir).iterdir():
@@ -170,6 +252,13 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
                         p.unlink()
                 except OSError:
                     pass
+
+    if platform in {"Instagram", "Threads"}:
+        try:
+            print(f"DOWNLOAD_FALLBACK platform={platform} method=og-meta", flush=True)
+            return download_direct_meta(url, tmpdir)
+        except Exception as exc:
+            errors.append(f"{platform}/og-meta: {type(exc).__name__}: {redact_secret(exc)}")
 
     raise RuntimeError(" | ".join(errors))
 
@@ -187,7 +276,6 @@ def probe_duration(path: Path) -> float:
 
 
 def normalize_mp4_segment(raw_part: Path, index: int, tmpdir: str) -> Path:
-    """Remux a segment without re-encoding so Telegram sees correct duration/resolution."""
     normalized = Path(tmpdir) / f"telegram-normalized-{index:03d}.mp4"
     cmd = [
         "ffmpeg", "-y", "-fflags", "+genpts", "-i", str(raw_part),
@@ -200,7 +288,6 @@ def normalize_mp4_segment(raw_part: Path, index: int, tmpdir: str) -> Path:
 
 
 def split_for_telegram(path: Path, tmpdir: str) -> list[Path]:
-    """Split large files without re-encoding, then normalize every part identically."""
     size = path.stat().st_size
     if size <= MAX_TELEGRAM_VIDEO_BYTES:
         return [path]
@@ -225,7 +312,6 @@ def split_for_telegram(path: Path, tmpdir: str) -> list[Path]:
         raise RuntimeError("Video splitting produced no files")
 
     parts = [normalize_mp4_segment(part, index, tmpdir) for index, part in enumerate(raw_parts, 1)]
-
     oversized = [p for p in parts if p.stat().st_size > MAX_TELEGRAM_VIDEO_BYTES]
     if oversized:
         raise RuntimeError("A split part is still too large; retry with a lower source quality")
@@ -250,7 +336,10 @@ def handle_message(message: dict):
         return
 
     if text.startswith("/start") or text.startswith("/help"):
-        send_message(chat_id, "Пришли ссылку на видео. Я скачаю ролик и отправлю его обратно в Telegram.")
+        send_message(
+            chat_id,
+            "Пришли ссылку на видео или пост. Поддерживаю YouTube, VK, TikTok, Instagram, Threads и другие сайты через yt-dlp.",
+        )
         return
 
     match = URL_RE.search(text)
@@ -259,38 +348,44 @@ def handle_message(message: dict):
         return
 
     url = match.group(0).rstrip(".,;!?)\"]}")
-    status = send_message(chat_id, "⏳ Скачиваю видео…")
+    platform = detect_platform(url)
+    status = send_message(chat_id, f"⏳ {platform}: скачиваю медиа…")
     status_id = status["message_id"]
 
     try:
         with tempfile.TemporaryDirectory(prefix="tg-video-") as tmpdir:
             path, title = download_with_ytdlp(url, tmpdir)
-            original_size = path.stat().st_size
+            suffix = path.suffix.lower()
 
-            if original_size > MAX_TELEGRAM_VIDEO_BYTES:
-                edit_message(
-                    chat_id, status_id,
-                    f"⚡ Видео скачалось ({original_size / 1024 / 1024:.1f} МБ). "
-                    "Быстро делю на части без потери качества…",
-                )
-                parts = split_for_telegram(path, tmpdir)
+            if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+                edit_message(chat_id, status_id, f"📤 {platform}: отправляю фото…")
+                send_photo(chat_id, path, title)
             else:
-                parts = [path]
-
-            total = len(parts)
-            for index, part in enumerate(parts, 1):
-                send_chat_action(chat_id, "upload_video")
-                if total > 1:
-                    edit_message(chat_id, status_id, f"📤 Отправляю часть {index}/{total}…")
-                    caption = f"{title}\nЧасть {index}/{total}"
+                original_size = path.stat().st_size
+                if original_size > MAX_TELEGRAM_VIDEO_BYTES:
+                    edit_message(
+                        chat_id,
+                        status_id,
+                        f"⚡ {platform}: файл {original_size / 1024 / 1024:.1f} МБ. Быстро делю на части без потери качества…",
+                    )
+                    parts = split_for_telegram(path, tmpdir)
                 else:
-                    edit_message(chat_id, status_id, "📤 Отправляю видео…")
-                    caption = title
+                    parts = [path]
 
-                if part.suffix.lower() == ".mp4":
-                    send_video(chat_id, part, caption)
-                else:
-                    send_document(chat_id, part, caption)
+                total = len(parts)
+                for index, part in enumerate(parts, 1):
+                    send_chat_action(chat_id, "upload_video")
+                    if total > 1:
+                        edit_message(chat_id, status_id, f"📤 {platform}: отправляю часть {index}/{total}…")
+                        caption = f"{title}\nЧасть {index}/{total}"
+                    else:
+                        edit_message(chat_id, status_id, f"📤 {platform}: отправляю видео…")
+                        caption = title
+
+                    if part.suffix.lower() == ".mp4":
+                        send_video(chat_id, part, caption)
+                    else:
+                        send_document(chat_id, part, caption)
 
         try:
             tg("deleteMessage", data={"chat_id": chat_id, "message_id": status_id})
@@ -300,7 +395,11 @@ def handle_message(message: dict):
         print("DOWNLOAD_ERROR:", safe_error_text(exc), flush=True)
         error_text = safe_error_text(exc)
         try:
-            edit_message(chat_id, status_id, f"❌ Не получилось скачать или подготовить видео.\n\nТехническая причина:\n{error_text}")
+            edit_message(
+                chat_id,
+                status_id,
+                f"❌ {platform}: не получилось скачать или подготовить медиа.\n\nТехническая причина:\n{error_text}",
+            )
         except Exception:
             send_message(chat_id, "❌ Ошибка при обработке ссылки.")
 

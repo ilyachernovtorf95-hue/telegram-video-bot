@@ -8,7 +8,7 @@ from pathlib import Path
 WHISPER_BIN = os.environ.get("WHISPER_CPP_BIN", "/usr/local/bin/whisper-cli")
 WHISPER_MODEL = os.environ.get("WHISPER_CPP_MODEL", "/opt/models/ggml-small-q5_1.bin")
 LLAMA_BIN = os.environ.get("LOCAL_LLM_BIN", "/usr/local/bin/llama-cli")
-LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "/opt/models/Qwen3-0.6B-Q8_0.gguf")
+LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "/opt/models/Qwen3-0.6B-Q4_K_M.gguf")
 THREADS = max(1, min(4, int(os.environ.get("LOCAL_AI_THREADS", "2"))))
 LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru").strip().lower() or "ru"
 
@@ -30,7 +30,7 @@ RU_STOP = {
 }
 
 CORRECTIONS = [
-    (r"\b(?:чат\s*джи\s*пи\s*ти|чатджипити|чат\s*гпт|чаджипити|чаджи\s*пити|джипити|chatgpt|chatgpt|chatgbt|chatgpt)\b", "ChatGPT"),
+    (r"\b(?:чат\s*джи\s*пи\s*ти|чатджипити|чат\s*гпт|чаджипити|чаджи\s*пити|джипити|chatgpt|chatgbt)\b", "ChatGPT"),
     (r"\b(?:опен\s*эй\s*ай|оупен\s*эй\s*ай|опенай)\b", "OpenAI"),
     (r"\b(?:джи\s*пи\s*ти)[ -]?(4|5)\b", r"GPT-\1"),
     (r"\b(?:обсидиан|обсидиум)\b", "Obsidian"),
@@ -50,8 +50,6 @@ def _cleanup(text: str) -> str:
 
 def _prepare_audio(video_path: Path, workdir: Path) -> Path:
     wav = workdir / "speech.wav"
-    # Speech-oriented preprocessing: mono/16 kHz plus gentle cleanup and normalization.
-    # We intentionally avoid aggressive denoise, which can damage consonants and names.
     filters = "highpass=f=70,lowpass=f=7800,loudnorm=I=-16:TP=-1.5:LRA=11"
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
@@ -135,8 +133,8 @@ def _similarity(a: str, b: str) -> float:
     return len(sa & sb) / max(1, min(len(sa), len(sb)))
 
 
-def _compact_source(text: str, max_chars: int = 10500) -> str:
-    """Keep the most informative, non-duplicate material if a transcript is long."""
+def _compact_source(text: str, max_chars: int = 6000) -> str:
+    """Keep informative, non-duplicate material within the small local model context."""
     text = _cleanup(text)
     if len(text) <= max_chars:
         return text
@@ -150,7 +148,6 @@ def _compact_source(text: str, max_chars: int = 10500) -> str:
     for i, s in enumerate(sents):
         ws = [w for w in _tokens(s) if w not in RU_STOP]
         score = sum(freq.get(w, 0) for w in ws) / max(8, len(ws))
-        # Preserve context from beginning and ending as well as high-information middle sentences.
         if i < 3 or i >= len(sents) - 3:
             score *= 1.25
         ranked.append((score, i, s))
@@ -172,7 +169,6 @@ def _strip_llm_noise(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
     text = re.sub(r"^.*?assistant\s*[:：]\s*", "", text, flags=re.S | re.I)
     text = text.strip()
-    # Some CLI builds may echo a small prompt fragment despite --no-display-prompt.
     marker = "🧠 КРАТКО"
     if marker in text:
         text = text[text.find(marker):]
@@ -185,61 +181,70 @@ def _semantic_summary(text: str, title: str = "") -> str:
 
     source = _compact_source(text)
     system = (
-        "Ты сильный редактор русскоязычных заметок. Тебе дают автоматическую транскрипцию видео, "
-        "в которой могут быть ошибки распознавания. Пойми смысл по контексту и исправляй только очевидные "
-        "ошибки имён/терминов. Не выдумывай факты. Не повторяй транскрипцию дословно. "
-        "Сжимай смысл: тезис, аргументы, полезные выводы. Если фрагмент неясен, просто не опирайся на него."
+        "Ты редактор русскоязычных заметок. Тебе дают автоматическую транскрипцию видео с возможными ошибками ASR. "
+        "Восстанови смысл по контексту, исправляй только очевидные ошибки терминов и имён. Не выдумывай факты. "
+        "Не копируй транскрипцию дословно и не повторяй одну мысль разными словами. Пиши коротко и содержательно."
     )
     user = f"""Название/контекст: {title or 'не указан'}
 
 ТРАНСКРИПЦИЯ:
 {source}
 
-Сделай содержательную заметку СТРОГО в формате ниже. Каждый пункт должен добавлять новую информацию, без дублей.
+Сделай заметку строго в формате:
 
 🧠 КРАТКО
-2–4 предложения: о чём видео и в чём главный тезис.
+2–3 предложения: главный смысл видео.
 
 💡 ГЛАВНЫЕ МЫСЛИ
-• 3–7 конкретных смысловых тезисов своими словами.
+• 3–6 разных тезисов своими словами.
 
 🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ
-• Только реально полезные выводы или действия, которые следуют из видео. Если действий нет — один честный вывод.
+• Только полезные выводы или действия, реально следующие из видео.
 
 🏷 ТЕГИ
-5–8 содержательных тегов, без слов-паразитов и служебных слов.
+5–7 содержательных тегов.
 """
 
+    # llama-cli auto-enables conversation mode for chat-template models. Explicit
+    # single-turn mode is critical in a non-interactive Railway subprocess: without
+    # it the model can finish generation but keep waiting for stdin until timeout,
+    # which previously triggered the extractive fallback after many minutes.
     cmd = [
         LLAMA_BIN,
         "-m", LLM_MODEL,
         "-t", str(THREADS),
-        "-c", "4096",
-        "-n", "700",
+        "-c", "2048",
+        "-n", "450",
         "--temp", "0.2",
         "--top-p", "0.9",
         "--repeat-penalty", "1.12",
         "--no-display-prompt",
         "--no-show-timings",
-        "--simple-io",
         "--no-warmup",
-        "-rea", "off",
+        "-cnv",
         "-st",
         "-sys", system,
         "-p", user,
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1200)
+    print(f"LOCAL_LLM_START model={Path(LLM_MODEL).name} chars_in={len(source)} ctx=2048", flush=True)
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=420)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Локальная LLM превысила лимит 7 минут и была остановлена") from exc
+
     if result.returncode != 0:
-        raise RuntimeError("Локальная LLM завершилась ошибкой: " + (result.stderr or result.stdout or "")[-900:])
+        err = (result.stderr or result.stdout or "")[-1200:]
+        raise RuntimeError(f"Локальная LLM завершилась с кодом {result.returncode}: {err}")
     output = _strip_llm_noise(result.stdout)
     if len(output) < 120 or "🧠 КРАТКО" not in output:
-        raise RuntimeError("Локальная LLM вернула неполную выжимку")
+        diagnostic = (result.stdout or result.stderr or "")[-700:]
+        raise RuntimeError("Локальная LLM вернула неполную выжимку: " + diagnostic)
     print(f"LOCAL_SUMMARY model={Path(LLM_MODEL).name} chars_in={len(source)} chars_out={len(output)}", flush=True)
     return output
 
 
 def _fallback_summary(text: str) -> str:
-    """Safe extractive fallback: used only if the local LLM cannot run."""
+    """Fast extractive fallback. It never blocks video delivery if the LLM fails."""
     text = _cleanup(text)
     sents = _sentences(text)
     if not sents:
@@ -269,7 +274,7 @@ def _fallback_summary(text: str) -> str:
             break
     return (
         f"🧠 КРАТКО\n{short}\n\n💡 ГЛАВНЫЕ МЫСЛИ\n{bullets}\n\n"
-        "🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ\n• Смысловая модель была недоступна; смотри тезисы и полную транскрипцию.\n\n"
+        "🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ\n• Локальная смысловая модель не завершила обработку; ниже сохранена полная транскрипция.\n\n"
         f"🏷 ТЕГИ\n{' '.join(tags)}"
     )
 
@@ -278,5 +283,5 @@ def summarize(text: str, title: str = "") -> str:
     try:
         return _semantic_summary(_cleanup(text), title=title)
     except Exception as exc:
-        print("LOCAL_LLM_FALLBACK:", str(exc)[-900:], flush=True)
+        print("LOCAL_LLM_FALLBACK:", str(exc)[-1200:], flush=True)
         return _fallback_summary(text)

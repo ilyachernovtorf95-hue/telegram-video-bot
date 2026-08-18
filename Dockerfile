@@ -21,9 +21,10 @@ COPY --from=pot-builder /opt/bgutil-ytdlp-pot-provider /opt/bgutil-ytdlp-pot-pro
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py .
+COPY bot.py local_ai.py ./
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium
+ENV WHISPER_MODEL=tiny
 
 CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec python bot.py"]

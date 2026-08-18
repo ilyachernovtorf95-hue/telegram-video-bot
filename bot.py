@@ -224,6 +224,34 @@ def handle(message):
         except Exception: send(chat_id,"❌ Ошибка при обработке ссылки.")
 
 
+def acknowledge_update(update_id):
+    """Advance Telegram's server-side update cursor BEFORE heavy processing.
+
+    Without this acknowledgement, a Railway worker restart during Whisper/LLM work
+    makes Telegram deliver the same link again, causing the video to be sent over
+    and over. Receiving an update alone does not permanently acknowledge it.
+    """
+    params={
+        "offset": update_id + 1,
+        "timeout": 0,
+        "limit": 1,
+        "allowed_updates": json.dumps(["message"]),
+    }
+    last_error=None
+    for attempt in range(4):
+        try:
+            r=requests.get(f"{API}/getUpdates",params=params,timeout=15)
+            r.raise_for_status()
+            payload=r.json()
+            if not payload.get("ok"):
+                raise RuntimeError(payload)
+            return
+        except Exception as exc:
+            last_error=exc
+            time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError("Не удалось подтвердить Telegram update: " + clean_error(last_error))
+
+
 def main():
     me=tg("getMe",timeout=30); tg("deleteWebhook",data={"drop_pending_updates":"false"},timeout=30)
     print(f"Telegram video bot started as @{me.get('username','unknown')}",flush=True)
@@ -236,7 +264,12 @@ def main():
             r=requests.get(f"{API}/getUpdates",params=params,timeout=60); r.raise_for_status(); payload=r.json()
             if not payload.get("ok"): raise RuntimeError(payload)
             for u in payload["result"]:
-                offset=u["update_id"]+1
+                update_id=u["update_id"]
+                # Critical: acknowledge server-side before download/ASR/LLM. If the
+                # container is OOM-killed or restarted later, this link will NOT be
+                # delivered and sent again.
+                acknowledge_update(update_id)
+                offset=update_id+1
                 if u.get("message"): handle(u["message"])
         except KeyboardInterrupt: break
         except Exception as exc: print("Polling error:",clean_error(exc),flush=True); time.sleep(3)

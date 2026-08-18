@@ -22,6 +22,14 @@ POT_SCRIPT = "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
 CHROME_PATH = os.environ.get("CHROME_PATH", "/usr/bin/chromium")
 
 
+def redact_secret(text: str) -> str:
+    text = str(text)
+    if TOKEN:
+        text = text.replace(TOKEN, "***")
+    text = re.sub(r"https://api\.telegram\.org/bot[^/\s]+", "https://api.telegram.org/bot***", text)
+    return text
+
+
 def tg(method: str, *, data=None, files=None, params=None, timeout=90):
     response = requests.post(
         f"{API}/{method}",
@@ -103,8 +111,6 @@ def ytdlp_options(tmpdir: str, player_client: str) -> dict:
 
 def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
     errors = []
-    # mweb + PO token provider is the current recommended yt-dlp setup.
-    # web_safari is a useful fallback because it may expose HLS formats.
     for player_client in ("mweb", "web_safari", "android_vr"):
         try:
             print(f"DOWNLOAD_ATTEMPT player_client={player_client}", flush=True)
@@ -121,10 +127,9 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
             mp4s = [p for p in candidates if p.suffix.lower() == ".mp4"]
             return (mp4s[0] if mp4s else candidates[0]), title
         except Exception as exc:
-            message = f"{player_client}: {type(exc).__name__}: {exc}"
+            message = f"{player_client}: {type(exc).__name__}: {redact_secret(exc)}"
             errors.append(message)
             print("DOWNLOAD_ATTEMPT_FAILED:", message, flush=True)
-            # Remove partial files before the next extraction strategy.
             for p in Path(tmpdir).iterdir():
                 try:
                     if p.is_file():
@@ -136,7 +141,7 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
 
 
 def safe_error_text(exc: Exception) -> str:
-    text = re.sub(r"https://api\.telegram\.org/bot[^/\s]+", "https://api.telegram.org/bot***", str(exc))
+    text = redact_secret(exc)
     text = re.sub(r"\s+", " ", text).strip()
     return text[-700:] if text else type(exc).__name__
 
@@ -149,10 +154,7 @@ def handle_message(message: dict):
         return
 
     if text.startswith("/start") or text.startswith("/help"):
-        send_message(
-            chat_id,
-            "Пришли ссылку на видео. Я попробую скачать ролик и отправить его обратно в Telegram.",
-        )
+        send_message(chat_id, "Пришли ссылку на видео. Я попробую скачать ролик и отправить его обратно в Telegram.")
         return
 
     match = URL_RE.search(text)
@@ -194,7 +196,7 @@ def handle_message(message: dict):
         except Exception:
             pass
     except Exception as exc:
-        print("DOWNLOAD_ERROR:", repr(exc), flush=True)
+        print("DOWNLOAD_ERROR:", safe_error_text(exc), flush=True)
         error_text = safe_error_text(exc)
         try:
             tg(
@@ -238,7 +240,7 @@ def main():
         except KeyboardInterrupt:
             break
         except Exception as exc:
-            print("Polling error:", repr(exc), flush=True)
+            print("Polling error:", safe_error_text(exc), flush=True)
             time.sleep(3)
 
 

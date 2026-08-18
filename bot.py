@@ -19,6 +19,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
 POT_SCRIPT = "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
+CHROME_PATH = os.environ.get("CHROME_PATH", "/usr/bin/chromium")
 
 
 def tg(method: str, *, data=None, files=None, params=None, timeout=90):
@@ -57,7 +58,7 @@ def send_video(chat_id: int, path: Path, caption: str = ""):
                 "supports_streaming": "true",
             },
             files={"video": (path.name, fh, "video/mp4")},
-            timeout=180,
+            timeout=240,
         )
 
 
@@ -68,7 +69,7 @@ def send_document(chat_id: int, path: Path, caption: str = ""):
             "sendDocument",
             data={"chat_id": chat_id, "caption": caption[:1024]},
             files={"document": (path.name, fh, mime)},
-            timeout=180,
+            timeout=240,
         )
 
 
@@ -76,39 +77,68 @@ def clean_title(title: str) -> str:
     return re.sub(r"\s+", " ", title or "Видео").strip()
 
 
-def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
-    outtmpl = str(Path(tmpdir) / "%(title).80s-%(id)s.%(ext)s")
-    options = {
+def ytdlp_options(tmpdir: str, player_client: str) -> dict:
+    return {
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
-        "outtmpl": outtmpl,
+        "outtmpl": str(Path(tmpdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": False,
         "no_warnings": False,
+        "verbose": True,
         "restrictfilenames": True,
         "merge_output_format": "mp4",
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
         "socket_timeout": 30,
+        "concurrent_fragment_downloads": 1,
         "js_runtimes": {"node": {"path": "/usr/local/bin/node"}},
         "extractor_args": {
-            "youtube": {"player_client": ["mweb"]},
+            "youtube": {"player_client": [player_client]},
             "youtubepot-bgutilscript": {"script_path": [POT_SCRIPT]},
+            "youtubepot-wpc": {"browser_path": [CHROME_PATH]},
         },
     }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = clean_title(info.get("title"))
 
-    candidates = sorted(
-        [p for p in Path(tmpdir).iterdir() if p.is_file()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise RuntimeError("Downloaded file was not found")
 
-    mp4s = [p for p in candidates if p.suffix.lower() == ".mp4"]
-    return (mp4s[0] if mp4s else candidates[0]), title
+def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
+    errors = []
+    # mweb + PO token provider is the current recommended yt-dlp setup.
+    # web_safari is a useful fallback because it may expose HLS formats.
+    for player_client in ("mweb", "web_safari", "android_vr"):
+        try:
+            print(f"DOWNLOAD_ATTEMPT player_client={player_client}", flush=True)
+            with yt_dlp.YoutubeDL(ytdlp_options(tmpdir, player_client)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = clean_title(info.get("title"))
+            candidates = sorted(
+                [p for p in Path(tmpdir).iterdir() if p.is_file() and not p.name.endswith(".part")],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not candidates:
+                raise RuntimeError("Downloaded file was not found")
+            mp4s = [p for p in candidates if p.suffix.lower() == ".mp4"]
+            return (mp4s[0] if mp4s else candidates[0]), title
+        except Exception as exc:
+            message = f"{player_client}: {type(exc).__name__}: {exc}"
+            errors.append(message)
+            print("DOWNLOAD_ATTEMPT_FAILED:", message, flush=True)
+            # Remove partial files before the next extraction strategy.
+            for p in Path(tmpdir).iterdir():
+                try:
+                    if p.is_file():
+                        p.unlink()
+                except OSError:
+                    pass
+
+    raise RuntimeError(" | ".join(errors))
+
+
+def safe_error_text(exc: Exception) -> str:
+    text = re.sub(r"https://api\.telegram\.org/bot[^/\s]+", "https://api.telegram.org/bot***", str(exc))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[-700:] if text else type(exc).__name__
 
 
 def handle_message(message: dict):
@@ -121,8 +151,7 @@ def handle_message(message: dict):
     if text.startswith("/start") or text.startswith("/help"):
         send_message(
             chat_id,
-            "Пришли ссылку на видео. Я попробую скачать ролик и отправить его обратно в Telegram.\n\n"
-            "Некоторые сайты требуют вход, cookies или блокируют скачивание.",
+            "Пришли ссылку на видео. Я попробую скачать ролик и отправить его обратно в Telegram.",
         )
         return
 
@@ -148,8 +177,8 @@ def handle_message(message: dict):
                         "chat_id": chat_id,
                         "message_id": status_id,
                         "text": (
-                            f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ, "
-                            "поэтому бот не может отправить его текущим способом."
+                            f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ. "
+                            "Нужна версия меньшего размера для отправки через этого бота."
                         ),
                     },
                 )
@@ -166,16 +195,14 @@ def handle_message(message: dict):
             pass
     except Exception as exc:
         print("DOWNLOAD_ERROR:", repr(exc), flush=True)
+        error_text = safe_error_text(exc)
         try:
             tg(
                 "editMessageText",
                 data={
                     "chat_id": chat_id,
                     "message_id": status_id,
-                    "text": (
-                        "❌ Не получилось скачать или отправить это видео. "
-                        "Я уже записал техническую ошибку в лог для диагностики."
-                    ),
+                    "text": f"❌ Не получилось скачать видео.\n\nТехническая причина:\n{error_text}",
                 },
             )
         except Exception:
@@ -188,6 +215,7 @@ def main():
     print(f"Telegram video bot started as @{me.get('username', 'unknown')}", flush=True)
     print(f"yt-dlp version: {yt_dlp.version.__version__}", flush=True)
     print(f"PO token script exists: {Path(POT_SCRIPT).exists()}", flush=True)
+    print(f"Chromium exists: {Path(CHROME_PATH).exists()} ({CHROME_PATH})", flush=True)
 
     offset = None
     while True:

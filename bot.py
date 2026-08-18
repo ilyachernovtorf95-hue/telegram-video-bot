@@ -18,26 +18,17 @@ if ":" not in TOKEN:
 API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 MAX_TELEGRAM_VIDEO_BYTES = int(os.environ.get("MAX_TELEGRAM_VIDEO_MB", "49")) * 1024 * 1024
-POT_SCRIPT = "/opt/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
-CHROME_PATH = os.environ.get("CHROME_PATH", "/usr/bin/chromium")
 
 
 def redact_secret(text: str) -> str:
     text = str(text)
     if TOKEN:
         text = text.replace(TOKEN, "***")
-    text = re.sub(r"https://api\.telegram\.org/bot[^/\s]+", "https://api.telegram.org/bot***", text)
-    return text
+    return re.sub(r"https://api\.telegram\.org/bot[^/\s]+", "https://api.telegram.org/bot***", text)
 
 
 def tg(method: str, *, data=None, files=None, params=None, timeout=90):
-    response = requests.post(
-        f"{API}/{method}",
-        data=data,
-        files=files,
-        params=params,
-        timeout=timeout,
-    )
+    response = requests.post(f"{API}/{method}", data=data, files=files, params=params, timeout=timeout)
     response.raise_for_status()
     payload = response.json()
     if not payload.get("ok"):
@@ -60,11 +51,7 @@ def send_video(chat_id: int, path: Path, caption: str = ""):
     with path.open("rb") as fh:
         return tg(
             "sendVideo",
-            data={
-                "chat_id": chat_id,
-                "caption": caption[:1024],
-                "supports_streaming": "true",
-            },
+            data={"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"},
             files={"video": (path.name, fh, "video/mp4")},
             timeout=240,
         )
@@ -86,8 +73,10 @@ def clean_title(title: str) -> str:
 
 
 def ytdlp_options(tmpdir: str, player_client: str) -> dict:
+    # Do not force mp4+m4a here: web_safari often exposes HLS formats only.
+    # yt-dlp + ffmpeg will merge/transcode container metadata when needed.
     return {
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
+        "format": "bv*[height<=720]+ba/b[height<=720]/best",
         "outtmpl": str(Path(tmpdir) / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": False,
@@ -103,20 +92,23 @@ def ytdlp_options(tmpdir: str, player_client: str) -> dict:
         "js_runtimes": {"node": {"path": "/usr/local/bin/node"}},
         "extractor_args": {
             "youtube": {"player_client": [player_client]},
-            "youtubepot-bgutilscript": {"script_path": [POT_SCRIPT]},
-            "youtubepot-wpc": {"browser_path": [CHROME_PATH]},
+            # HTTP provider is started by Docker on the default 127.0.0.1:4416.
+            "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
         },
     }
 
 
 def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
     errors = []
+    # mweb + PO token is the primary path. web_safari can expose HLS streams
+    # that currently do not require a GVS PO token. android_vr is a final fallback.
     for player_client in ("mweb", "web_safari", "android_vr"):
         try:
             print(f"DOWNLOAD_ATTEMPT player_client={player_client}", flush=True)
             with yt_dlp.YoutubeDL(ytdlp_options(tmpdir, player_client)) as ydl:
                 info = ydl.extract_info(url, download=True)
                 title = clean_title(info.get("title"))
+
             candidates = sorted(
                 [p for p in Path(tmpdir).iterdir() if p.is_file() and not p.name.endswith(".part")],
                 key=lambda p: p.stat().st_mtime,
@@ -141,14 +133,12 @@ def download_with_ytdlp(url: str, tmpdir: str) -> tuple[Path, str]:
 
 
 def safe_error_text(exc: Exception) -> str:
-    text = redact_secret(exc)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", redact_secret(exc)).strip()
     return text[-700:] if text else type(exc).__name__
 
 
 def handle_message(message: dict):
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
+    chat_id = (message.get("chat") or {}).get("id")
     text = (message.get("text") or "").strip()
     if not chat_id:
         return
@@ -178,10 +168,7 @@ def handle_message(message: dict):
                     data={
                         "chat_id": chat_id,
                         "message_id": status_id,
-                        "text": (
-                            f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ. "
-                            "Нужна версия меньшего размера для отправки через этого бота."
-                        ),
+                        "text": f"Видео скачалось, но весит {size / 1024 / 1024:.1f} МБ. Нужна версия меньшего размера.",
                     },
                 )
                 return
@@ -216,8 +203,6 @@ def main():
     tg("deleteWebhook", data={"drop_pending_updates": "false"}, timeout=30)
     print(f"Telegram video bot started as @{me.get('username', 'unknown')}", flush=True)
     print(f"yt-dlp version: {yt_dlp.version.__version__}", flush=True)
-    print(f"PO token script exists: {Path(POT_SCRIPT).exists()}", flush=True)
-    print(f"Chromium exists: {Path(CHROME_PATH).exists()} ({CHROME_PATH})", flush=True)
 
     offset = None
     while True:
@@ -225,18 +210,15 @@ def main():
             params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
             if offset is not None:
                 params["offset"] = offset
-
             response = requests.get(f"{API}/getUpdates", params=params, timeout=60)
             response.raise_for_status()
             payload = response.json()
             if not payload.get("ok"):
                 raise RuntimeError(payload)
-
             for update in payload["result"]:
                 offset = update["update_id"] + 1
                 if update.get("message"):
                     handle_message(update["message"])
-
         except KeyboardInterrupt:
             break
         except Exception as exc:

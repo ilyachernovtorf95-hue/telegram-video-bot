@@ -1,28 +1,15 @@
-name: Run Telegram Bot
+name: Run Telegram Bot (disabled - Railway hosts production)
+
+# The production bot runs continuously on Railway.
+# This workflow intentionally does not start bot.py, because a second
+# long-polling process using the same Telegram token causes HTTP 409 conflicts.
 
 on:
   workflow_dispatch:
 
 jobs:
-  bot:
+  info:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python bot.py
+      - name: Railway is the production runtime
+        run: echo "Bot runtime is hosted on Railway; GitHub Actions runner is disabled to prevent duplicate Telegram polling."

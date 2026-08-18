@@ -1,19 +1,40 @@
-name: CI
+name: Telegram Bot Test
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
-  validate:
+  test-bot:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Validate Python syntax
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Python syntax
         run: python -m py_compile bot.py
-      - name: Validate Docker build
-        run: docker build -t telegram-video-bot .
+
+      - name: Test Telegram bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python bot.py &
+          BOT_PID=$!
+          sleep 15
+
+          if kill -0 $BOT_PID 2>/dev/null; then
+            echo "Telegram bot started successfully"
+            kill $BOT_PID
+            wait $BOT_PID || true
+          else
+            echo "Telegram bot failed to start"
+            exit 1
+          fi

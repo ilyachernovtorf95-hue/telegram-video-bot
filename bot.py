@@ -53,11 +53,44 @@ def send_chat_action(chat_id: int, action: str):
         pass
 
 
+def probe_video_metadata(path: Path) -> tuple[int, int, int]:
+    """Return width, height and duration for Telegram sendVideo metadata."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    payload = json.loads(result.stdout or "{}")
+    streams = payload.get("streams") or [{}]
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    duration = max(1, int(round(float((payload.get("format") or {}).get("duration") or 0))))
+    return width, height, duration
+
+
 def send_video(chat_id: int, path: Path, caption: str = ""):
+    width, height, duration = probe_video_metadata(path)
+    data = {
+        "chat_id": chat_id,
+        "caption": caption[:1024],
+        "supports_streaming": "true",
+        "duration": str(duration),
+    }
+    if width > 0 and height > 0:
+        data["width"] = str(width)
+        data["height"] = str(height)
+
     with path.open("rb") as fh:
         return tg(
             "sendVideo",
-            data={"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"},
+            data=data,
             files={"video": (path.name, fh, "video/mp4")},
             timeout=600,
         )
@@ -80,8 +113,6 @@ def clean_title(title: str) -> str:
 
 def ytdlp_options(tmpdir: str, player_client: str) -> dict:
     return {
-        # Prefer a single, reasonably small progressive stream. This avoids downloading
-        # huge 720p files only to spend many minutes transcoding them afterwards.
         "format": (
             "best[ext=mp4][filesize<=46M]/"
             "best[filesize<=46M]/"
@@ -155,34 +186,55 @@ def probe_duration(path: Path) -> float:
     return duration
 
 
+def normalize_mp4_segment(raw_part: Path, index: int, tmpdir: str) -> Path:
+    """Remux a segment without re-encoding so Telegram sees correct duration/resolution."""
+    normalized = Path(tmpdir) / f"telegram-normalized-{index:03d}.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-fflags", "+genpts", "-i", str(raw_part),
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+        str(normalized),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
+    return normalized
+
+
 def split_for_telegram(path: Path, tmpdir: str) -> list[Path]:
-    """Fast path for large files: split on keyframes without re-encoding."""
+    """Split large files without re-encoding, then normalize every part identically."""
     size = path.stat().st_size
     if size <= MAX_TELEGRAM_VIDEO_BYTES:
         return [path]
 
     duration = probe_duration(path)
-    # 82% safety margin handles variable bitrate and keyframe-aligned cuts.
     segment_seconds = max(30, int(duration * SAFE_PART_BYTES / size * 0.82))
-    pattern = str(Path(tmpdir) / "telegram-part-%03d.mp4")
+    pattern = str(Path(tmpdir) / "telegram-raw-part-%03d.mp4")
     cmd = [
-        "ffmpeg", "-y", "-i", str(path),
+        "ffmpeg", "-y", "-fflags", "+genpts", "-i", str(path),
         "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
         "-f", "segment", "-segment_time", str(segment_seconds),
-        "-reset_timestamps", "1", "-movflags", "+faststart", pattern,
+        "-reset_timestamps", "1",
+        "-segment_format", "mp4",
+        "-segment_format_options", "movflags=+faststart",
+        pattern,
     ]
     print(f"FAST_SPLIT size={size / 1024 / 1024:.1f}MB segment={segment_seconds}s", flush=True)
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
-    parts = sorted(Path(tmpdir).glob("telegram-part-*.mp4"))
-    if not parts:
+
+    raw_parts = sorted(Path(tmpdir).glob("telegram-raw-part-*.mp4"))
+    if not raw_parts:
         raise RuntimeError("Video splitting produced no files")
+
+    parts = [normalize_mp4_segment(part, index, tmpdir) for index, part in enumerate(raw_parts, 1)]
 
     oversized = [p for p in parts if p.stat().st_size > MAX_TELEGRAM_VIDEO_BYTES]
     if oversized:
-        raise RuntimeError(
-            "A split part is still too large; retry with a lower source quality"
-        )
-    print("FAST_SPLIT_RESULT " + ", ".join(f"{p.stat().st_size/1024/1024:.1f}MB" for p in parts), flush=True)
+        raise RuntimeError("A split part is still too large; retry with a lower source quality")
+
+    metadata = []
+    for p in parts:
+        w, h, d = probe_video_metadata(p)
+        metadata.append(f"{p.name}:{w}x{h}/{d}s/{p.stat().st_size/1024/1024:.1f}MB")
+    print("FAST_SPLIT_RESULT " + ", ".join(metadata), flush=True)
     return parts
 
 
@@ -219,7 +271,7 @@ def handle_message(message: dict):
                 edit_message(
                     chat_id, status_id,
                     f"⚡ Видео скачалось ({original_size / 1024 / 1024:.1f} МБ). "
-                    "Быстро делю на части без перекодирования…",
+                    "Быстро делю на части без потери качества…",
                 )
                 parts = split_for_telegram(path, tmpdir)
             else:

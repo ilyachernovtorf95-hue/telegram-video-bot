@@ -9,9 +9,11 @@ from pathlib import Path
 import requests
 import yt_dlp
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TOKEN = re.sub(r"\s+", "", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+if ":" not in TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN has an invalid format")
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)

@@ -48,6 +48,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py local_ai.py ./
 
+# llama.cpp CLI changes frequently. Keep the semantic stage on the stable CLI
+# surface instead of passing reasoning/special-token switches that may be
+# rejected by the freshly built llama-cli and silently force extractive fallback.
+RUN sed -i '/"-rea", "off",/d; /"-st",/d' /app/local_ai.py
+
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium
 ENV WHISPER_CPP_MODEL=/opt/models/ggml-small-q5_1.bin

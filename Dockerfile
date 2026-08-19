@@ -9,28 +9,20 @@ RUN git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdl
 WORKDIR /opt/bgutil-ytdlp-pot-provider/server
 RUN npm ci && npx tsc
 
-FROM debian:bookworm-slim AS native-builder
+FROM debian:bookworm-slim AS whisper-builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git cmake build-essential ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git \
-    && cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+RUN git clone --depth 1 --branch v1.9.1 https://github.com/ggml-org/whisper.cpp.git \
+    && cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
     && cmake --build whisper.cpp/build -j2 --target whisper-cli
-
-# Pin a known llama.cpp release instead of building an arbitrary moving master.
-RUN git clone --depth 1 --branch b10218 https://github.com/ggml-org/llama.cpp.git \
-    && cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
-    && cmake --build llama.cpp/build -j2 --target llama-cli
 
 RUN mkdir -p /models \
     && curl -L --fail --retry 4 --retry-delay 3 \
-      -o /models/ggml-small-q5_1.bin \
-      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin?download=true \
-    && curl -L --fail --retry 4 --retry-delay 3 \
-      -o /models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-      https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true
+      -o /models/ggml-tiny.bin \
+      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin?download=true
 
 FROM python:3.12-slim
 
@@ -40,20 +32,22 @@ RUN apt-get update \
 
 COPY --from=pot-builder /usr/local/bin/node /usr/local/bin/node
 COPY --from=pot-builder /opt/bgutil-ytdlp-pot-provider /opt/bgutil-ytdlp-pot-provider
-COPY --from=native-builder /src/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli
-COPY --from=native-builder /src/llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli
-COPY --from=native-builder /models /opt/models
+COPY --from=whisper-builder /src/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=whisper-builder /models /opt/models
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py local_ai.py ./
+COPY bot.py local_ai.py gemini_ai.py sitecustomize.py ./
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium
-ENV WHISPER_CPP_MODEL=/opt/models/ggml-small-q5_1.bin
-ENV LOCAL_LLM_MODEL=/opt/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-ENV LOCAL_AI_THREADS=2
-ENV LOCAL_LLM_TIMEOUT=75
+ENV WHISPER_CPP_MODEL=/opt/models/ggml-tiny.bin
+ENV WHISPER_LANGUAGE=ru
+ENV LOCAL_AI_THREADS=1
+ENV GEMINI_MODELS=gemini-3.7-flash,gemini-3.5-flash-lite
+ENV GEMINI_FILE_TIMEOUT=180
+ENV GEMINI_REQUEST_TIMEOUT=180
+ENV GEMINI_UPLOAD_TIMEOUT=300
 
 CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec python bot.py"]

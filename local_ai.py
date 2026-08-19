@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -8,7 +9,7 @@ from pathlib import Path
 WHISPER_BIN = os.environ.get("WHISPER_CPP_BIN", "/usr/local/bin/whisper-cli")
 WHISPER_MODEL = os.environ.get("WHISPER_CPP_MODEL", "/opt/models/ggml-small-q5_1.bin")
 LLAMA_BIN = os.environ.get("LOCAL_LLM_BIN", "/usr/local/bin/llama-cli")
-LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "/opt/models/Qwen3-0.6B-Q4_K_M.gguf")
+LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "/opt/models/qwen2.5-0.5b-instruct-q4_k_m.gguf")
 THREADS = max(1, min(4, int(os.environ.get("LOCAL_AI_THREADS", "2"))))
 LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru").strip().lower() or "ru"
 
@@ -133,8 +134,7 @@ def _similarity(a: str, b: str) -> float:
     return len(sa & sb) / max(1, min(len(sa), len(sb)))
 
 
-def _compact_source(text: str, max_chars: int = 6000) -> str:
-    """Keep informative, non-duplicate material within the small local model context."""
+def _compact_source(text: str, max_chars: int = 4500) -> str:
     text = _cleanup(text)
     if len(text) <= max_chars:
         return text
@@ -165,86 +165,142 @@ def _compact_source(text: str, max_chars: int = 6000) -> str:
     return " ".join(x[2] for x in sorted(chosen, key=lambda x: x[1]))
 
 
-def _strip_llm_noise(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
-    text = re.sub(r"^.*?assistant\s*[:：]\s*", "", text, flags=re.S | re.I)
-    text = text.strip()
-    marker = "🧠 КРАТКО"
-    if marker in text:
-        text = text[text.find(marker):]
-    return text.strip()
+def _extract_json(raw: str) -> dict:
+    raw = (raw or "").strip()
+    if not raw:
+        raise RuntimeError("Локальная LLM вернула пустой ответ")
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        raise RuntimeError("Локальная LLM не вернула JSON")
+    try:
+        obj = json.loads(raw[start:end + 1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Локальная LLM вернула повреждённый JSON") from exc
+    if not isinstance(obj, dict):
+        raise RuntimeError("Локальная LLM вернула неожиданный формат")
+    return obj
+
+
+def _clean_list(value, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        item = _cleanup(str(item))
+        if len(item) < 4:
+            continue
+        if any(_similarity(item, old) > 0.82 for old in out):
+            continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _format_payload(obj: dict) -> str:
+    short = _cleanup(str(obj.get("summary") or ""))
+    points = _clean_list(obj.get("main_points"), 6)
+    actions = _clean_list(obj.get("actions"), 4)
+    tags_raw = obj.get("tags") if isinstance(obj.get("tags"), list) else []
+    tags = []
+    for tag in tags_raw:
+        tag = re.sub(r"[^A-Za-zА-Яа-яЁё0-9_-]", "", str(tag).strip().lstrip("#").lower())
+        if len(tag) >= 3 and tag not in tags:
+            tags.append("#" + tag)
+        if len(tags) >= 7:
+            break
+
+    if len(short) < 40 or len(points) < 2:
+        raise RuntimeError("Смысловая модель вернула слишком мало полезного содержания")
+    if not actions:
+        actions = ["Практических действий в ролике не заявлено; сохранить ключевые идеи как справочную заметку."]
+    if not tags:
+        tags = ["#видео", "#заметка"]
+
+    return (
+        f"🧠 КРАТКО\n{short}\n\n"
+        "💡 ГЛАВНЫЕ МЫСЛИ\n" + "\n".join("• " + x for x in points) + "\n\n"
+        "🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ\n" + "\n".join("• " + x for x in actions) + "\n\n"
+        "🏷 ТЕГИ\n" + " ".join(tags)
+    )
+
+
+def _run_llm(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Локальная LLM превысила лимит {timeout // 60} минут и была остановлена") from exc
 
 
 def _semantic_summary(text: str, title: str = "") -> str:
-    if not Path(LLAMA_BIN).exists() or not Path(LLM_MODEL).exists():
-        raise RuntimeError("Локальная LLM недоступна")
+    if not Path(LLAMA_BIN).exists():
+        raise RuntimeError("llama-cli не найден в контейнере")
+    if not Path(LLM_MODEL).exists():
+        raise RuntimeError(f"Файл локальной LLM не найден: {LLM_MODEL}")
 
     source = _compact_source(text)
     system = (
-        "Ты редактор русскоязычных заметок. Тебе дают автоматическую транскрипцию видео с возможными ошибками ASR. "
-        "Восстанови смысл по контексту, исправляй только очевидные ошибки терминов и имён. Не выдумывай факты. "
-        "Не копируй транскрипцию дословно и не повторяй одну мысль разными словами. Пиши коротко и содержательно."
+        "Ты редактор русскоязычных заметок. Анализируй транскрипцию видео. "
+        "Исправляй только очевидные ошибки распознавания по контексту. Не выдумывай факты. "
+        "Не копируй длинные фразы дословно. Объединяй повторы и формулируй смысл своими словами."
     )
     user = f"""Название/контекст: {title or 'не указан'}
 
 ТРАНСКРИПЦИЯ:
 {source}
 
-Сделай заметку строго в формате:
-
-🧠 КРАТКО
-2–3 предложения: главный смысл видео.
-
-💡 ГЛАВНЫЕ МЫСЛИ
-• 3–6 разных тезисов своими словами.
-
-🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ
-• Только полезные выводы или действия, реально следующие из видео.
-
-🏷 ТЕГИ
-5–7 содержательных тегов.
+Верни JSON со следующими полями:
+summary — 2–3 коротких предложения с главным смыслом ролика;
+main_points — массив из 3–6 разных содержательных тезисов;
+actions — массив из 1–4 полезных выводов или действий, только если они следуют из ролика;
+tags — массив из 5–7 тематических тегов без символа #.
+Все значения пиши на русском. Не повторяй один и тот же тезис в разных полях.
 """
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "main_points": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 6},
+            "actions": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 7},
+        },
+        "required": ["summary", "main_points", "actions", "tags"],
+        "additionalProperties": False,
+    }
 
-    # llama-cli auto-enables conversation mode for chat-template models. Explicit
-    # single-turn mode is critical in a non-interactive Railway subprocess: without
-    # it the model can finish generation but keep waiting for stdin until timeout,
-    # which previously triggered the extractive fallback after many minutes.
-    cmd = [
+    base = [
         LLAMA_BIN,
         "-m", LLM_MODEL,
         "-t", str(THREADS),
         "-c", "2048",
-        "-n", "450",
-        "--temp", "0.2",
+        "-n", "360",
+        "--temp", "0.15",
         "--top-p", "0.9",
         "--repeat-penalty", "1.12",
         "--no-display-prompt",
         "--no-show-timings",
         "--no-warmup",
-        "-cnv",
+        "--jinja",
         "-st",
+        "-j", json.dumps(schema, ensure_ascii=False),
         "-sys", system,
         "-p", user,
     ]
-    print(f"LOCAL_LLM_START model={Path(LLM_MODEL).name} chars_in={len(source)} ctx=2048", flush=True)
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=420)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Локальная LLM превысила лимит 7 минут и была остановлена") from exc
 
+    print(f"LOCAL_LLM_START model={Path(LLM_MODEL).name} chars_in={len(source)} mode=json", flush=True)
+    result = _run_llm(base, timeout=300)
     if result.returncode != 0:
-        err = (result.stderr or result.stdout or "")[-1200:]
+        err = (result.stderr or result.stdout or "")[-1400:]
         raise RuntimeError(f"Локальная LLM завершилась с кодом {result.returncode}: {err}")
-    output = _strip_llm_noise(result.stdout)
-    if len(output) < 120 or "🧠 КРАТКО" not in output:
-        diagnostic = (result.stdout or result.stderr or "")[-700:]
-        raise RuntimeError("Локальная LLM вернула неполную выжимку: " + diagnostic)
+
+    obj = _extract_json(result.stdout)
+    output = _format_payload(obj)
     print(f"LOCAL_SUMMARY model={Path(LLM_MODEL).name} chars_in={len(source)} chars_out={len(output)}", flush=True)
     return output
 
 
 def _fallback_summary(text: str) -> str:
-    """Fast extractive fallback. It never blocks video delivery if the LLM fails."""
     text = _cleanup(text)
     sents = _sentences(text)
     if not sents:
@@ -261,20 +317,22 @@ def _fallback_summary(text: str) -> str:
         if any(_similarity(item[2], x[2]) > 0.68 for x in chosen):
             continue
         chosen.append(item)
-        if len(chosen) >= min(5, len(sents)):
+        if len(chosen) >= min(4, len(sents)):
             break
     chosen = sorted(chosen, key=lambda x: x[1])
-    short = " ".join(x[2] for x in chosen[:2])[:1000]
+    short = " ".join(x[2] for x in chosen[:2])[:800]
     bullets = "\n".join("• " + x[2] for x in chosen)
     tags = []
     for word, _ in freq.most_common(20):
         if len(word) >= 4 and word not in RU_STOP:
-            tags.append("#" + re.sub(r"[^A-Za-zА-Яа-яЁё0-9_-]", "", word))
+            tag = "#" + re.sub(r"[^A-Za-zА-Яа-яЁё0-9_-]", "", word)
+            if tag not in tags:
+                tags.append(tag)
         if len(tags) >= 6:
             break
     return (
         f"🧠 КРАТКО\n{short}\n\n💡 ГЛАВНЫЕ МЫСЛИ\n{bullets}\n\n"
-        "🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ\n• Локальная смысловая модель не завершила обработку; ниже сохранена полная транскрипция.\n\n"
+        "🎯 ЧТО СТОИТ ЗАПОМНИТЬ / СДЕЛАТЬ\n• Смысловая модель временно не завершила обработку; сохранена полная транскрипция.\n\n"
         f"🏷 ТЕГИ\n{' '.join(tags)}"
     )
 
@@ -283,5 +341,5 @@ def summarize(text: str, title: str = "") -> str:
     try:
         return _semantic_summary(_cleanup(text), title=title)
     except Exception as exc:
-        print("LOCAL_LLM_FALLBACK:", str(exc)[-1200:], flush=True)
+        print("LOCAL_LLM_FALLBACK:", str(exc)[-1400:], flush=True)
         return _fallback_summary(text)

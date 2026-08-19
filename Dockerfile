@@ -19,7 +19,8 @@ RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git \
     && cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
     && cmake --build whisper.cpp/build -j2 --target whisper-cli
 
-RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git \
+# Pin a known llama.cpp release instead of building an arbitrary moving master.
+RUN git clone --depth 1 --branch b10218 https://github.com/ggml-org/llama.cpp.git \
     && cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
     && cmake --build llama.cpp/build -j2 --target llama-cli
 
@@ -53,5 +54,6 @@ ENV CHROME_PATH=/usr/bin/chromium
 ENV WHISPER_CPP_MODEL=/opt/models/ggml-small-q5_1.bin
 ENV LOCAL_LLM_MODEL=/opt/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ENV LOCAL_AI_THREADS=2
+ENV LOCAL_LLM_TIMEOUT=75
 
 CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec python bot.py"]

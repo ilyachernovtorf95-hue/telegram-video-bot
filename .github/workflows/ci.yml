@@ -23,10 +23,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Check Python syntax
-        run: python -m py_compile bot.py local_ai.py gemini_ai.py sitecustomize.py
+        run: python -m py_compile bot.py local_ai.py gemini_ai.py sitecustomize.py yt_dlp_plugins/extractor/vk_channel.py
 
-      - name: Check imports
-        run: python -c "import requests, yt_dlp; print('Python dependencies OK')"
+      - name: Check imports and VK channel URL routing
+        run: |
+          python -c "import requests, yt_dlp; print('Python dependencies OK')"
+          python -c "from yt_dlp_plugins.extractor.vk_channel import VKChannelPostIE; assert VKChannelPostIE.suitable('https://vk.ru/im/channels/-230766877?cmid=10315'); assert VKChannelPostIE.suitable('https://vk.com/im/channels/-230766877?cmid=10315'); print('VK channel extractor routing OK')"
 
       - name: Build production Docker image
         run: docker build --progress=plain -t telegram-video-bot:ci .

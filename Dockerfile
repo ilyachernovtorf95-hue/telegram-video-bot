@@ -39,6 +39,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py local_ai.py gemini_ai.py sitecustomize.py ./
+COPY yt_dlp_plugins ./yt_dlp_plugins
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium

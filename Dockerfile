@@ -38,7 +38,7 @@ COPY --from=whisper-builder /models /opt/models
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py bot_runner.py local_ai.py gemini_ai.py sitecustomize.py ./
+COPY bot.py bot_runner.py youtube_compat.py local_ai.py gemini_ai.py sitecustomize.py ./
 COPY yt_dlp_plugins ./yt_dlp_plugins
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
@@ -54,6 +54,7 @@ ENV GEMINI_REQUEST_TIMEOUT=180
 ENV GEMINI_UPLOAD_TIMEOUT=300
 
 # ENTRYPOINT enforces the single primary Railway runtime even if the service still
-# has a stale custom Start Command. It always launches the responsive dispatcher.
+# has a stale custom Start Command. It launches the responsive dispatcher through
+# youtube_compat.py, which starts heavy YouTube helpers only on demand.
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD []

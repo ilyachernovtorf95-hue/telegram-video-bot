@@ -51,4 +51,6 @@ ENV GEMINI_FILE_TIMEOUT=180
 ENV GEMINI_REQUEST_TIMEOUT=180
 ENV GEMINI_UPLOAD_TIMEOUT=300
 
-CMD ["sh", "-c", "if [ -n \"${RAILWAY_PROJECT_NAME:-}\" ] && [ \"$RAILWAY_PROJECT_NAME\" != \"adventurous-perception\" ]; then echo \"Standby deployment: Telegram polling disabled for Railway project $RAILWAY_PROJECT_NAME\"; exec tail -f /dev/null; fi; node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec xvfb-run -a -s '-screen 0 1280x720x24' python bot.py"]
+# Only the primary Railway project is allowed to long-poll Telegram.
+# Railway-provided project IDs are immutable and therefore safer than project names.
+CMD ["sh", "-c", "if [ -n \"${RAILWAY_PROJECT_ID:-}\" ] && [ \"$RAILWAY_PROJECT_ID\" != \"0782ee62-74b0-447a-94e3-e88cd24c2e01\" ]; then echo \"Standby deployment: Telegram polling disabled for Railway project ${RAILWAY_PROJECT_NAME:-unknown} ($RAILWAY_PROJECT_ID)\"; exec tail -f /dev/null; fi; node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec xvfb-run -a -s '-screen 0 1280x720x24' python bot.py"]

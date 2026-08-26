@@ -40,6 +40,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py bot_runner.py local_ai.py gemini_ai.py sitecustomize.py ./
 COPY yt_dlp_plugins ./yt_dlp_plugins
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium
@@ -51,6 +53,7 @@ ENV GEMINI_FILE_TIMEOUT=180
 ENV GEMINI_REQUEST_TIMEOUT=180
 ENV GEMINI_UPLOAD_TIMEOUT=300
 
-# Only the primary Railway project is allowed to long-poll Telegram.
-# Heavy media processing runs in a worker so Telegram commands stay responsive.
-CMD ["sh", "-c", "if [ -n \"${RAILWAY_PROJECT_ID:-}\" ] && [ \"$RAILWAY_PROJECT_ID\" != \"0782ee62-74b0-447a-94e3-e88cd24c2e01\" ]; then echo \"Standby deployment: Telegram polling disabled for Railway project ${RAILWAY_PROJECT_NAME:-unknown} ($RAILWAY_PROJECT_ID)\"; exec tail -f /dev/null; fi; node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec xvfb-run -a -s '-screen 0 1280x720x24' python bot_runner.py"]
+# ENTRYPOINT enforces the single primary Railway runtime even if the service still
+# has a stale custom Start Command. It always launches the responsive dispatcher.
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD []

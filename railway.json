@@ -5,7 +5,9 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+    "startCommand": "/bin/sh -c 'if [ -n \"${RAILWAY_PROJECT_ID:-}\" ] && [ \"$RAILWAY_PROJECT_ID\" != \"0782ee62-74b0-447a-94e3-e88cd24c2e01\" ]; then echo \"STANDBY: Telegram polling disabled for ${RAILWAY_PROJECT_NAME:-unknown} ($RAILWAY_PROJECT_ID)\"; exec tail -f /dev/null; fi; echo \"PRIMARY: starting responsive Telegram dispatcher\"; node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & exec xvfb-run -a -s \"-screen 0 1280x720x24\" python /app/bot_runner.py'",
+    "restartPolicyType": "ALWAYS",
+    "overlapSeconds": "0",
+    "drainingSeconds": "5"
   }
 }

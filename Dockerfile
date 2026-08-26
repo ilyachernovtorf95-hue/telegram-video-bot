@@ -27,7 +27,7 @@ RUN mkdir -p /models \
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates chromium libgomp1 libstdc++6 \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates chromium xvfb xauth libgomp1 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pot-builder /usr/local/bin/node /usr/local/bin/node
@@ -51,4 +51,4 @@ ENV GEMINI_FILE_TIMEOUT=180
 ENV GEMINI_REQUEST_TIMEOUT=180
 ENV GEMINI_UPLOAD_TIMEOUT=300
 
-CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec python bot.py"]
+CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec xvfb-run -a -s '-screen 0 1280x720x24' python bot.py"]

@@ -19,12 +19,8 @@ elif [ -n "$PROJECT_NAME" ] && [ "$PROJECT_NAME" != "$PRIMARY_PROJECT_NAME" ]; t
   exec tail -f /dev/null
 fi
 
-echo "PRIMARY: starting Telegram bot in ${PROJECT_NAME:-local} (${PROJECT_ID:-no-project-id})"
+echo "PRIMARY: starting responsive Telegram bot in ${PROJECT_NAME:-local} (${PROJECT_ID:-no-project-id})"
 
-# YouTube PO-token helper. A failure here must not prevent Telegram from starting.
-node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 &
-
-# Always run the responsive dispatcher. Intentionally ignore any stale Railway
-# Start Command arguments so an old `python bot.py` override cannot re-enable the
-# blocking legacy poller.
-exec xvfb-run -a -s '-screen 0 1280x720x24' python /app/bot_runner.py
+# Keep idle runtime light. youtube_compat.py starts the PO-token helper only while
+# a YouTube job is actually being processed, then stops it again.
+exec python /app/youtube_compat.py

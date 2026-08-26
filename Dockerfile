@@ -51,4 +51,4 @@ ENV GEMINI_FILE_TIMEOUT=180
 ENV GEMINI_REQUEST_TIMEOUT=180
 ENV GEMINI_UPLOAD_TIMEOUT=300
 
-CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec xvfb-run -a -s '-screen 0 1280x720x24' python bot.py"]
+CMD ["sh", "-c", "if [ -n \"${RAILWAY_PROJECT_NAME:-}\" ] && [ \"$RAILWAY_PROJECT_NAME\" != \"adventurous-perception\" ]; then echo \"Standby deployment: Telegram polling disabled for Railway project $RAILWAY_PROJECT_NAME\"; exec tail -f /dev/null; fi; node /opt/bgutil-ytdlp-pot-provider/server/build/main.js >/tmp/pot-provider.log 2>&1 & sleep 2; exec xvfb-run -a -s '-screen 0 1280x720x24' python bot.py"]

@@ -49,12 +49,12 @@ ENV WHISPER_CPP_MODEL=/opt/models/ggml-tiny.bin
 ENV WHISPER_LANGUAGE=ru
 ENV LOCAL_AI_THREADS=1
 ENV GEMINI_MODELS=gemini-3.7-flash,gemini-3.5-flash-lite
-ENV GEMINI_FILE_TIMEOUT=180
-ENV GEMINI_REQUEST_TIMEOUT=180
-ENV GEMINI_UPLOAD_TIMEOUT=300
+ENV GEMINI_FILE_TIMEOUT=300
+ENV GEMINI_REQUEST_TIMEOUT=600
+ENV GEMINI_UPLOAD_TIMEOUT=600
 
 # ENTRYPOINT enforces the single primary Railway runtime. The resilient runner
-# keeps Telegram responsive, tries normal YouTube download fallbacks first, and
-# falls back to Gemini's native YouTube URL analysis if Railway's IP is blocked.
+# keeps Telegram responsive and makes the knowledge analysis independent from
+# YouTube/Railway MP4 delivery.
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD []

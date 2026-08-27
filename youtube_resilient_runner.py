@@ -1,17 +1,17 @@
-"""Production runner with a non-failing YouTube path.
+"""Production runner with a resilient YouTube path.
 
-For YouTube we still try to download the file through the existing reliability
-layer. If YouTube blocks Railway's datacenter IP, we do not fail the whole job:
-Gemini analyzes the public YouTube URL directly and the bot still returns the
-summary, chapters, visual context, transcript and Obsidian note.
+YouTube is treated as two independent jobs:
+1) knowledge extraction through Gemini's native public-YouTube-URL input;
+2) best-effort MP4 download through yt-dlp.
 
-The actual YouTube MP4 remains a separate concern because YouTube can block
-server-side downloads by IP reputation. A free iPhone-local download route is
-shown only when that happens.
+They run in parallel. This keeps summaries/transcripts reliable even when
+YouTube blocks Railway's datacenter IP, while still returning the MP4 whenever
+server-side download succeeds.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 import tempfile
 
@@ -25,8 +25,8 @@ from youtube_direct import analyze_youtube_url
 
 _ORIGINAL_HANDLE = bot.handle
 
-# Maintained, free, local-on-device yt-dlp route for iOS. It avoids Railway's
-# datacenter IP because the download happens on the user's iPhone connection.
+# Free local-on-device yt-dlp route for iOS. The download happens from the
+# user's iPhone IP rather than Railway's datacenter IP.
 ASHELL_MINI_URL = "https://apps.apple.com/app/a-shell-mini/id1543537943"
 SW_DLT_URL = "https://www.icloud.com/shortcuts/695f53b649c947d998ae058d03efcc43"
 
@@ -47,21 +47,7 @@ def _youtube_title(url: str) -> str:
     return "YouTube видео"
 
 
-def _send_direct_analysis(chat_id, status_id, tmpdir, title, url, download_error):
-    if not is_configured():
-        raise RuntimeError(
-            "YouTube не дал скачать файл с IP Railway, а GEMINI_API_KEY не настроен "
-            "для прямого анализа YouTube URL."
-        )
-
-    bot.edit(
-        chat_id,
-        status_id,
-        "🧠 YouTube: серверная загрузка файла заблокирована, но анализ продолжается "
-        "напрямую через Gemini — без скачивания видео Railway.",
-    )
-
-    result = analyze_youtube_url(url, title=title, platform="YouTube")
+def _emit_analysis(chat_id, tmpdir, title, url, result):
     summary = format_analysis(result)
     bot.send_long(chat_id, f"📝 {title}\n\n{summary}")
     note = bot.note_file(tmpdir, title, url, "YouTube", result)
@@ -71,26 +57,17 @@ def _send_direct_analysis(chat_id, status_id, tmpdir, title, url, download_error
         f"📚 Заметка: выжимка + полная транскрипция • {result.get('engine', 'Gemini')}",
     )
 
-    bot.edit(
-        chat_id,
-        status_id,
-        "✅ YouTube: анализ и транскрипция завершены напрямую через Gemini. "
-        "Сам MP4 YouTube не отдаёт серверному IP Railway.",
-    )
 
-    # Do not dump a giant yt-dlp error into Telegram anymore. Give one concise,
-    # practical file-download fallback that uses the user's own iPhone IP.
+def _send_local_file_route(chat_id):
     bot.send(
         chat_id,
-        "📱 Нужен сам файл YouTube без оплаты? Используй локальный путь на iPhone: "
-        "a-Shell mini + SW-DLT. Скачивание идёт с твоего IP, поэтому блокировка Railway "
-        "не участвует. После установки: YouTube → Поделиться → SW-DLT.\n\n"
-        f"a-Shell mini: {ASHELL_MINI_URL}\n"
-        f"SW-DLT: {SW_DLT_URL}\n\n"
-        "Это требуется только для самого MP4; анализ, транскрипция и .md уже выполнены ботом автоматически.",
+        "📱 Сам MP4 YouTube серверу Railway не отдал. Бесплатный устойчивый путь для файла — "
+        "скачать его локально на iPhone, где используется твой обычный IP:\n\n"
+        f"1) a-Shell mini: {ASHELL_MINI_URL}\n"
+        f"2) SW-DLT: {SW_DLT_URL}\n"
+        "3) Затем: YouTube → Поделиться → SW-DLT.\n\n"
+        "Это нужно только для физического MP4. Анализ, транскрипция, таймкоды и .md бот делает сам.",
     )
-    print(f"YOUTUBE_DOWNLOAD_BLOCKED_DIRECT_ANALYSIS_OK: {download_error}", flush=True)
-    return result
 
 
 def _handle_youtube(message, url: str):
@@ -98,59 +75,106 @@ def _handle_youtube(message, url: str):
     if not chat_id:
         return
 
-    status = bot.send(chat_id, "⏳ YouTube: пытаюсь получить видео и параллельно готовлю резервный анализ…")
+    status = bot.send(
+        chat_id,
+        "⏳ YouTube: анализирую ролик напрямую через Gemini и одновременно пытаюсь получить MP4…",
+    )
     status_id = status["message_id"]
 
     with tempfile.TemporaryDirectory(prefix="tg-youtube-") as tmpdir:
         title = _youtube_title(url)
+
+        analysis_future = None
+        executor = None
+        if is_configured():
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gemini-youtube")
+            analysis_future = executor.submit(analyze_youtube_url, url, title, "YouTube")
+
+        downloaded = None
+        download_error = ""
         try:
             downloaded, downloaded_title = bot.download(url, tmpdir)
             title = downloaded_title or title
         except Exception as exc:
-            error = bot.clean_error(exc)
-            print("YOUTUBE_DOWNLOAD_FAIL_FALLBACK_TO_GEMINI_URL:", error, flush=True)
+            download_error = bot.clean_error(exc)
+            print("YOUTUBE_MP4_DOWNLOAD_FAIL:", download_error, flush=True)
+
+        result = None
+        analysis_error = ""
+        if analysis_future is not None:
             try:
-                _send_direct_analysis(chat_id, status_id, tmpdir, title, url, error)
-            except Exception as analysis_exc:
-                analysis_error = bot.clean_error(analysis_exc)
-                bot.edit(
-                    chat_id,
-                    status_id,
-                    "❌ YouTube: не удалось ни скачать файл, ни завершить прямой Gemini-анализ.\n\n"
-                    f"Причина анализа: {analysis_error}",
-                )
-            return
+                bot.edit(chat_id, status_id, "🧠 YouTube: завершаю смысловой анализ и транскрипцию…")
+                result = analysis_future.result(timeout=240)
+            except Exception as exc:
+                analysis_error = bot.clean_error(exc)
+                print("YOUTUBE_DIRECT_ANALYSIS_FAIL:", analysis_error, flush=True)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
-        try:
-            source_video = bot.normalize_mp4(downloaded, tmpdir)
-            parts = bot.split_video(source_video, tmpdir)
-            for index, part in enumerate(parts, 1):
-                bot.action(chat_id, "upload_video")
-                if len(parts) == 1:
-                    bot.edit(chat_id, status_id, "📤 YouTube: отправляю видео…")
-                    caption = title
-                else:
-                    bot.edit(chat_id, status_id, f"📤 YouTube: отправляю видео {index}/{len(parts)}…")
-                    caption = f"{title}\nЧасть {index}/{len(parts)}"
-                bot.send_video(chat_id, part, caption)
+        # If direct URL analysis failed but the MP4 did download, reuse the older
+        # file-upload analysis as a fallback instead of losing the job.
+        source_video = None
+        if downloaded is not None:
+            try:
+                source_video = bot.normalize_mp4(downloaded, tmpdir)
+                parts = bot.split_video(source_video, tmpdir)
+                for index, part in enumerate(parts, 1):
+                    bot.action(chat_id, "upload_video")
+                    if len(parts) == 1:
+                        bot.edit(chat_id, status_id, "📤 YouTube: отправляю видео…")
+                        caption = title
+                    else:
+                        bot.edit(chat_id, status_id, f"📤 YouTube: отправляю видео {index}/{len(parts)}…")
+                        caption = f"{title}\nЧасть {index}/{len(parts)}"
+                    bot.send_video(chat_id, part, caption)
+            except Exception as exc:
+                download_error = (download_error + " | " + bot.clean_error(exc)).strip(" |")
+                source_video = None
+                print("YOUTUBE_MP4_POSTPROCESS_FAIL:", download_error, flush=True)
 
-            result = bot.analyze(chat_id, status_id, source_video, tmpdir, title, url, "YouTube")
+        if result is None and source_video is not None:
+            try:
+                result = bot.analyze(chat_id, status_id, source_video, tmpdir, title, url, "YouTube")
+            except Exception as exc:
+                analysis_error = (analysis_error + " | " + bot.clean_error(exc)).strip(" |")
+                print("YOUTUBE_FILE_ANALYSIS_FAIL:", analysis_error, flush=True)
+        elif result is not None:
+            _emit_analysis(chat_id, tmpdir, title, url, result)
+
+        if result is None:
             bot.edit(
                 chat_id,
                 status_id,
-                "✅ YouTube: готово. Видео отправлено, анализ и транскрипция завершены "
+                "❌ YouTube: не удалось завершить анализ.\n\n"
+                f"Анализ: {analysis_error or 'неизвестная ошибка'}",
+            )
+            return
+
+        if source_video is not None:
+            bot.edit(
+                chat_id,
+                status_id,
+                "✅ YouTube: готово. MP4 отправлен, анализ и транскрипция завершены "
                 f"({result.get('engine', 'AI')}).",
             )
-        except Exception as exc:
-            error = bot.clean_error(exc)
-            print("YOUTUBE_POST_DOWNLOAD_PROCESSING_ERROR:", error, flush=True)
-            bot.edit(chat_id, status_id, f"❌ YouTube: ошибка после загрузки видео.\n\n{error}")
+            return
+
+        # The core knowledge task is successful even when YouTube rejects the
+        # Railway IP. Present that as a successful partial result, not a giant
+        # technical error, and offer the only robust free MP4 route for iPhone.
+        bot.edit(
+            chat_id,
+            status_id,
+            "✅ YouTube: анализ, транскрипция, таймкоды и .md готовы. "
+            "YouTube заблокировал только серверное получение MP4 с IP Railway.",
+        )
+        _send_local_file_route(chat_id)
+        print(f"YOUTUBE_DIRECT_ANALYSIS_OK_MP4_BLOCKED: {download_error}", flush=True)
 
 
 def resilient_handle(message):
     text = (message.get("text") or "").strip()
 
-    # Keep all commands and all non-YouTube behavior exactly as before.
     if text.startswith(("/start", "/help")):
         return _ORIGINAL_HANDLE(message)
 
@@ -166,8 +190,6 @@ def resilient_handle(message):
 
 
 def main():
-    # Reuse all current yt-dlp/PO-token/cookie/proxy attempts first. Only after
-    # they fail do we switch the knowledge path to Gemini's native YouTube URL.
     youtube_compat.install()
     bot.handle = resilient_handle
 

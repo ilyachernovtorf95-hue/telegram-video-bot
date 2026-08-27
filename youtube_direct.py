@@ -1,16 +1,13 @@
 """Direct YouTube analysis through Gemini.
 
-This bypasses yt-dlp entirely for the knowledge-extraction path. Gemini's
-Interactions API can consume a public YouTube URL directly, so Railway's
-YouTube download/IP restrictions do not prevent summaries, chapters, visual
-analysis, or transcription.
+This bypasses yt-dlp for the knowledge path. Public YouTube URLs are sent
+straight to Gemini at low video resolution so long podcasts/interviews can fit
+comfortably in the model context while preserving audio understanding.
 """
 
 from __future__ import annotations
 
 import json
-
-import requests
 
 import gemini_ai
 
@@ -27,6 +24,7 @@ def analyze_youtube_url(url: str, title: str = "", platform: str = "YouTube"):
         f"- Название: {title or 'не указано'}\n"
         f"- Исходная ссылка: {url}\n"
         "- Видео передано напрямую как публичный YouTube URL.\n"
+        "- Обязательно охвати весь ролик, даже если он длится несколько часов.\n"
     )
 
     errors = []
@@ -34,7 +32,7 @@ def analyze_youtube_url(url: str, title: str = "", platform: str = "YouTube"):
         payload = {
             "model": model,
             "input": [
-                {"type": "video", "uri": url},
+                {"type": "video", "uri": url, "resolution": "low"},
                 {"type": "text", "text": gemini_ai.PROMPT + context},
             ],
             "response_format": {
@@ -45,14 +43,9 @@ def analyze_youtube_url(url: str, title: str = "", platform: str = "YouTube"):
         }
 
         try:
-            response = requests.post(
-                f"{gemini_ai.API_BASE}/interactions",
-                headers={**gemini_ai._headers(), "Content-Type": "application/json"},
-                json=payload,
-                timeout=(30, gemini_ai.GEMINI_REQUEST_TIMEOUT),
+            raw = gemini_ai._extract_output_text(
+                gemini_ai._request_interaction(payload, f"Gemini YouTube model={model}")
             )
-            gemini_ai._raise_for_response(response, f"Gemini YouTube model={model}")
-            raw = gemini_ai._extract_output_text(response.json())
             data = json.loads(raw)
             result = gemini_ai._validate_analysis(data, model)
             result["engine"] = f"Gemini YouTube URL ({model})"

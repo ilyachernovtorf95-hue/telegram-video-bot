@@ -19,8 +19,9 @@ elif [ -n "$PROJECT_NAME" ] && [ "$PROJECT_NAME" != "$PRIMARY_PROJECT_NAME" ]; t
   exec tail -f /dev/null
 fi
 
-echo "PRIMARY: starting responsive Telegram bot in ${PROJECT_NAME:-local} (${PROJECT_ID:-no-project-id})"
+echo "PRIMARY: starting responsive Telegram bot with resilient YouTube path in ${PROJECT_NAME:-local} (${PROJECT_ID:-no-project-id})"
 
-# Keep idle runtime light. youtube_compat.py starts the PO-token helper only while
-# a YouTube job is actually being processed, then stops it again.
-exec python /app/youtube_compat.py
+# Normal yt-dlp download attempts remain available. If YouTube blocks Railway's
+# datacenter IP, youtube_resilient_runner.py switches the knowledge workflow to
+# Gemini's native public-YouTube-URL input instead of failing the entire job.
+exec python /app/youtube_resilient_runner.py

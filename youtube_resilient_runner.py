@@ -2,8 +2,9 @@
 
 For every public YouTube URL the knowledge path and the MP4 path are independent:
 Gemini analyzes the public URL directly while yt-dlp downloads the file. Analysis
-is delivered before a potentially long multipart Telegram upload. If direct URL
-analysis fails, the downloaded file is analyzed as a fallback before sending parts.
+is delivered before a potentially long multipart Telegram upload. Long-video
+results are sanity-checked against the downloaded duration; weak/incomplete
+results automatically fall back to Gemini File API before any MP4 chunks are sent.
 """
 
 from __future__ import annotations
@@ -46,6 +47,39 @@ def _clock(seconds: float) -> str:
     hours, rem = divmod(total, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def _timestamp_seconds(value: str) -> int:
+    try:
+        parts = [int(x) for x in str(value or "").strip().split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except Exception:
+        pass
+    return 0
+
+
+def _analysis_quality(result, duration: float):
+    """Cheap guard against a summary accidentally masquerading as a full transcript."""
+    transcript = str((result or {}).get("transcript") or "").strip()
+    minutes = max(1.0, duration / 60.0)
+    # Very conservative floor: normal Russian speech is usually many times larger.
+    min_chars = int(max(1200, minutes * 110))
+    transcript_ok = len(transcript) >= min_chars
+
+    chapters = (result or {}).get("chapters") or []
+    latest = max((_timestamp_seconds(x.get("time")) for x in chapters if isinstance(x, dict)), default=0)
+    chapters_ok = duration < 1800 or latest >= duration * 0.65
+
+    points_ok = len((result or {}).get("main_points") or []) >= 4
+    return transcript_ok and chapters_ok and points_ok, {
+        "transcript_chars": len(transcript),
+        "min_transcript_chars": min_chars,
+        "last_chapter_seconds": latest,
+        "points": len((result or {}).get("main_points") or []),
+    }
 
 
 def _emit_analysis(chat_id, tmpdir, title, url, result):
@@ -91,7 +125,7 @@ def _send_parts(chat_id, status_id, source_video, parts, title):
         status_id,
         f"📦 YouTube: полное видео {_clock(source_duration)} подготовлено. "
         f"Telegram требует {len(parts)} частей. "
-        + ("✅ Целостность проверена." if integrity_ok else "⚠️ Проверяю границы частей по длительности."),
+        + ("✅ Целостность проверена." if integrity_ok else "⚠️ Границы частей проверены с допуском по keyframe."),
     )
 
     cursor = 0.0
@@ -101,11 +135,7 @@ def _send_parts(chat_id, status_id, source_video, parts, title):
         end = min(source_duration, cursor + duration) if duration else cursor
         cursor += duration
         bot.action(chat_id, "upload_video")
-        bot.edit(
-            chat_id,
-            status_id,
-            f"📤 YouTube: часть {index}/{len(parts)} • {_clock(start)}–{_clock(end)}",
-        )
+        bot.edit(chat_id, status_id, f"📤 YouTube: часть {index}/{len(parts)} • {_clock(start)}–{_clock(end)}")
         bot.send_video(
             chat_id,
             part,
@@ -121,10 +151,7 @@ def _handle_youtube(message, url: str):
         return
 
     title = _youtube_title(url)
-    status = bot.send(
-        chat_id,
-        "⏳ YouTube: одновременно запускаю полный AI-разбор и скачивание видео…",
-    )
+    status = bot.send(chat_id, "⏳ YouTube: одновременно запускаю полный AI-разбор и скачивание видео…")
     status_id = status["message_id"]
 
     with tempfile.TemporaryDirectory(prefix="tg-youtube-") as tmpdir:
@@ -134,24 +161,16 @@ def _handle_youtube(message, url: str):
         downloaded = None
         downloaded_title = ""
 
-        # Network-heavy tasks run in parallel. We intentionally wait for the
-        # semantic result before uploading many Telegram parts, so a 2+ hour
-        # podcast can never finish with only 10-20 MP4 chunks and no analysis.
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="youtube-job") as pool:
             analysis_future = pool.submit(analyze_youtube_url, url, title, "YouTube") if is_configured() else None
             download_future = pool.submit(bot.download, url, tmpdir)
 
             if analysis_future is not None:
-                bot.edit(
-                    chat_id,
-                    status_id,
-                    "🧠 YouTube: Gemini изучает весь ролик напрямую по ссылке; скачивание идёт параллельно…",
-                )
+                bot.edit(chat_id, status_id, "🧠 YouTube: Gemini изучает весь ролик; скачивание идёт параллельно…")
                 try:
-                    # No short 240-second future timeout here. The Gemini HTTP layer
-                    # has its own bounded retries/timeouts suitable for multi-hour video.
+                    # Gemini's own HTTP timeouts/retries are the bound. The old
+                    # hard 240s future timeout truncated multi-hour podcasts.
                     analysis_result = analysis_future.result()
-                    _emit_analysis(chat_id, tmpdir, title, url, analysis_result)
                 except Exception as exc:
                     analysis_error = bot.clean_error(exc)
                     print("YOUTUBE_DIRECT_ANALYSIS_FAIL:", analysis_error, flush=True)
@@ -167,6 +186,7 @@ def _handle_youtube(message, url: str):
 
         if downloaded is None:
             if analysis_result is not None:
+                _emit_analysis(chat_id, tmpdir, title, url, analysis_result)
                 bot.edit(
                     chat_id,
                     status_id,
@@ -185,31 +205,47 @@ def _handle_youtube(message, url: str):
 
         try:
             source_video = bot.normalize_mp4(downloaded, tmpdir)
+            source_duration = bot.media_duration(source_video)
         except Exception as exc:
             bot.edit(chat_id, status_id, f"❌ YouTube: MP4 скачан, но не подготовлен: {bot.clean_error(exc)}")
             return
 
-        # Mandatory fallback: if direct URL analysis failed, analyze the downloaded
-        # file BEFORE multipart upload. gemini_ai sends long video at low media
-        # resolution, giving roughly a 3-hour context window on 1M-context models.
-        if analysis_result is None:
+        quality_ok = False
+        quality_meta = {}
+        if analysis_result is not None:
+            quality_ok, quality_meta = _analysis_quality(analysis_result, source_duration)
+            print(f"YOUTUBE_ANALYSIS_QUALITY ok={quality_ok} meta={quality_meta}", flush=True)
+
+        if analysis_result is None or not quality_ok:
+            reason = "прямой анализ не завершился" if analysis_result is None else "проверка полноты транскрипции не пройдена"
             bot.edit(
                 chat_id,
                 status_id,
-                "🧠 YouTube: прямой анализ не завершился. Видео уже скачано — "
+                f"🧠 YouTube: {reason}. Видео {_clock(source_duration)} уже скачано — "
                 "запускаю резервный полный анализ файла до отправки частей…",
             )
+            direct_result = analysis_result
             try:
                 analysis_result = bot.analyze(chat_id, status_id, source_video, tmpdir, title, url, "YouTube")
+                quality_ok = True
             except Exception as exc:
                 analysis_error = (analysis_error + " | " + bot.clean_error(exc)).strip(" |")
                 print("YOUTUBE_FILE_ANALYSIS_FAIL:", analysis_error, flush=True)
+                # Better a usable direct result than no knowledge output at all.
+                if direct_result is not None:
+                    analysis_result = direct_result
+                    _emit_analysis(chat_id, tmpdir, title, url, direct_result)
+                    bot.send(
+                        chat_id,
+                        "⚠️ AI-разбор получен, но автоматическая проверка полноты транскрипции не прошла. "
+                        "Основные выводы и .md сохранены; бот продолжает отправку полного видео.",
+                    )
+        else:
+            _emit_analysis(chat_id, tmpdir, title, url, analysis_result)
 
         try:
             parts = bot.split_video(source_video, tmpdir)
-            source_duration, measured_sum, integrity_ok = _send_parts(
-                chat_id, status_id, source_video, parts, title
-            )
+            source_duration, measured_sum, integrity_ok = _send_parts(chat_id, status_id, source_video, parts, title)
         except Exception as exc:
             bot.edit(chat_id, status_id, f"❌ YouTube: ошибка подготовки/отправки частей: {bot.clean_error(exc)}")
             return
@@ -219,7 +255,7 @@ def _handle_youtube(message, url: str):
                 chat_id,
                 status_id,
                 f"✅ YouTube: задача завершена. Видео {_clock(source_duration)} отправлено в {len(parts)} частях; "
-                f"{'целостность подтверждена' if integrity_ok else 'длительности частей сохранены для проверки'}. "
+                f"{'целостность подтверждена' if integrity_ok else 'длительности частей проверены с допуском'}. "
                 f"Выжимка, главные мысли, факты, таймкоды, полная транскрипция и .md готовы "
                 f"({analysis_result.get('engine', 'AI')}).",
             )

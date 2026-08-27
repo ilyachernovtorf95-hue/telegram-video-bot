@@ -1,3 +1,4 @@
+import base64
 import json
 import mimetypes
 import os
@@ -12,6 +13,13 @@ GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.7-
 GEMINI_FILE_TIMEOUT = max(30, min(900, int(os.environ.get("GEMINI_FILE_TIMEOUT", "300"))))
 GEMINI_REQUEST_TIMEOUT = max(60, min(1200, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "600"))))
 GEMINI_UPLOAD_TIMEOUT = max(60, min(1200, int(os.environ.get("GEMINI_UPLOAD_TIMEOUT", "600"))))
+# Gemini documents inline video as the fastest one-off path for short files.
+# Keep the raw file ceiling conservative because base64 expands bytes by ~4/3
+# and the complete JSON request should remain below the documented 20 MB limit.
+GEMINI_INLINE_MAX_BYTES = max(
+    1 * 1024 * 1024,
+    min(14 * 1024 * 1024, int(os.environ.get("GEMINI_INLINE_MAX_MB", "14")) * 1024 * 1024),
+)
 BASE_URL = "https://generativelanguage.googleapis.com"
 API_BASE = f"{BASE_URL}/v1beta"
 UPLOAD_URL = f"{BASE_URL}/upload/v1beta/files"
@@ -265,21 +273,17 @@ def _validate_analysis(data, model):
     return result
 
 
-def _run_interaction(file_info, model, title, source_url, platform):
-    uri = str(file_info.get("uri") or "").strip()
-    mime = str(file_info.get("mimeType") or file_info.get("mime_type") or "video/mp4")
-    if not uri:
-        raise GeminiError("Gemini не вернул URI загруженного файла")
-    context = f"\nКонтекст:\n- Платформа: {platform or 'неизвестно'}\n- Название: {title or 'не указано'}\n- Исходная ссылка: {source_url or 'не указана'}\n"
-    payload = {
-        "model": model,
-        "input": [
-            {"type": "video", "uri": uri, "mime_type": mime, "resolution": "low"},
-            {"type": "text", "text": PROMPT + context},
-        ],
-        "response_format": {"type": "text", "mime_type": "application/json", "schema": ANALYSIS_SCHEMA},
-    }
-    raw = _extract_output_text(_request_interaction(payload, f"Gemini model={model}"))
+def _context(title, source_url, platform):
+    return (
+        f"\nКонтекст:\n"
+        f"- Платформа: {platform or 'неизвестно'}\n"
+        f"- Название: {title or 'не указано'}\n"
+        f"- Исходная ссылка: {source_url or 'не указана'}\n"
+    )
+
+
+def _parse_interaction(payload, model):
+    raw = _extract_output_text(payload)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -288,11 +292,55 @@ def _run_interaction(file_info, model, title, source_url, platform):
     return _validate_analysis(data, model)
 
 
-def analyze_video(path, title="", source_url="", platform=""):
-    if not GEMINI_API_KEY:
-        raise GeminiError("GEMINI_API_KEY не настроен")
-    if not GEMINI_MODELS:
-        raise GeminiError("Не указана ни одна модель Gemini")
+def _run_interaction(file_info, model, title, source_url, platform):
+    uri = str(file_info.get("uri") or "").strip()
+    mime = str(file_info.get("mimeType") or file_info.get("mime_type") or "video/mp4")
+    if not uri:
+        raise GeminiError("Gemini не вернул URI загруженного файла")
+    payload = {
+        "model": model,
+        "input": [
+            {"type": "video", "uri": uri, "mime_type": mime, "resolution": "low"},
+            {"type": "text", "text": PROMPT + _context(title, source_url, platform)},
+        ],
+        "response_format": {"type": "text", "mime_type": "application/json", "schema": ANALYSIS_SCHEMA},
+    }
+    return _parse_interaction(_request_interaction(payload, f"Gemini model={model}"), model)
+
+
+def _run_inline_interaction(path, model, title, source_url, platform):
+    path = Path(path)
+    mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    payload = {
+        "model": model,
+        "input": [
+            {"type": "video", "data": encoded, "mime_type": mime, "resolution": "low"},
+            {"type": "text", "text": PROMPT + _context(title, source_url, platform)},
+        ],
+        "response_format": {"type": "text", "mime_type": "application/json", "schema": ANALYSIS_SCHEMA},
+    }
+    return _parse_interaction(_request_interaction(payload, f"Gemini inline model={model}"), model)
+
+
+def _analyze_inline(path, title, source_url, platform):
+    errors = []
+    for model in GEMINI_MODELS:
+        try:
+            result = _run_inline_interaction(path, model, title, source_url, platform)
+            result["engine"] = f"Gemini inline ({model})"
+            print(
+                f"GEMINI_INLINE_OK model={model} bytes={Path(path).stat().st_size} transcript_chars={len(result['transcript'])}",
+                flush=True,
+            )
+            return result
+        except Exception as exc:
+            errors.append(f"{model}: {str(exc)[-900:]}")
+            print(f"GEMINI_INLINE_FAIL model={model}: {str(exc)[-900:]}", flush=True)
+    raise GeminiError(" | ".join(errors))
+
+
+def _analyze_via_file_api(path, title, source_url, platform):
     file_name = ""
     try:
         file_info = _upload_file(Path(path))
@@ -310,6 +358,25 @@ def analyze_video(path, title="", source_url="", platform=""):
         raise GeminiError(" | ".join(errors))
     finally:
         _delete_file(file_name)
+
+
+def analyze_video(path, title="", source_url="", platform=""):
+    if not GEMINI_API_KEY:
+        raise GeminiError("GEMINI_API_KEY не настроен")
+    if not GEMINI_MODELS:
+        raise GeminiError("Не указана ни одна модель Gemini")
+
+    path = Path(path)
+    # Fast path for short/small social clips: one Gemini request, no File API
+    # upload + ACTIVE polling. On any incompatibility we transparently fall back
+    # to the battle-tested File API path, so reliability is preserved.
+    if path.stat().st_size <= GEMINI_INLINE_MAX_BYTES:
+        try:
+            return _analyze_inline(path, title, source_url, platform)
+        except Exception as exc:
+            print(f"GEMINI_INLINE_FALLBACK_TO_FILE_API: {str(exc)[-900:]}", flush=True)
+
+    return _analyze_via_file_api(path, title, source_url, platform)
 
 
 def format_analysis(result):

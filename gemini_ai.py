@@ -9,9 +9,9 @@ import requests
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.7-flash,gemini-3.5-flash-lite").split(",") if m.strip()]
-GEMINI_FILE_TIMEOUT = max(30, min(300, int(os.environ.get("GEMINI_FILE_TIMEOUT", "180"))))
-GEMINI_REQUEST_TIMEOUT = max(30, min(300, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "180"))))
-GEMINI_UPLOAD_TIMEOUT = max(60, min(600, int(os.environ.get("GEMINI_UPLOAD_TIMEOUT", "300"))))
+GEMINI_FILE_TIMEOUT = max(30, min(900, int(os.environ.get("GEMINI_FILE_TIMEOUT", "300"))))
+GEMINI_REQUEST_TIMEOUT = max(60, min(1200, int(os.environ.get("GEMINI_REQUEST_TIMEOUT", "600"))))
+GEMINI_UPLOAD_TIMEOUT = max(60, min(1200, int(os.environ.get("GEMINI_UPLOAD_TIMEOUT", "600"))))
 BASE_URL = "https://generativelanguage.googleapis.com"
 API_BASE = f"{BASE_URL}/v1beta"
 UPLOAD_URL = f"{BASE_URL}/upload/v1beta/files"
@@ -37,29 +37,29 @@ ANALYSIS_SCHEMA = {
         "tags": {"type": "array", "items": {"type": "string"}},
         "transcript": {"type": "string"},
     },
-    "required": ["language","summary","main_points","key_facts","actions","visual_context","claims_to_verify","chapters","tags","transcript"],
+    "required": ["language", "summary", "main_points", "key_facts", "actions", "visual_context", "claims_to_verify", "chapters", "tags", "transcript"],
 }
 
-PROMPT = """Ты — профессиональный аналитик видео и редактор русскоязычных заметок.
+PROMPT = """Ты — профессиональный аналитик видео, редактор конспектов и точный транскрибатор.
 
-Проанализируй ВЕСЬ ролик: аудиодорожку, речь, текст в кадре и визуальный контекст.
-Нужен точный и полезный результат для личной базы знаний.
+Проанализируй ВЕСЬ ролик от начала до конца: речь, аудио, текст в кадре, демонстрации, схемы и визуальный контекст. Особенно важно не ограничиваться первыми минутами длинного интервью или подкаста.
 
 Правила:
-1. Не выдумывай факты и не добавляй сведения, которых нет в видео.
-2. Сначала пойми общий смысл ролика, а не копируй фразы автора.
-3. transcript — максимально полная транскрипция речи с нормальной пунктуацией. Сохраняй смысл и формулировки говорящего, но исправляй очевидные ошибки распознавания, имена брендов и общеизвестные термины по контексту.
-4. summary — 2–4 предложения своими словами, передающие основную идею ролика.
-5. main_points — 3–8 разных содержательных тезисов без повторов.
-6. key_facts — только конкретные факты, цифры, названия, утверждения или важные детали, которые действительно присутствуют в ролике. Если их нет, верни пустой список.
-7. actions — практические действия/идеи, которые разумно вынести из видео. Если ролик не содержит практического совета, верни пустой список.
-8. visual_context — только полезные детали изображения, без описания очевидного.
-9. claims_to_verify — утверждения автора, которые звучат как проверяемые факты, но требуют внешней проверки. Не объявляй их ложными или истинными.
-10. chapters — ключевые моменты ролика с приблизительными таймкодами MM:SS.
-11. tags — 4–8 коротких тематических тегов без символа #.
-12. Все аналитические поля пиши на русском. transcript оставь на языке речи.
-13. Не дублируй одну и ту же мысль в нескольких пунктах.
-14. Верни только данные по заданной JSON-схеме."""
+1. Не выдумывай факты, имена, цифры или выводы, которых нет в ролике.
+2. Отделяй факты из ролика от мнений/прогнозов спикеров. Рекламу не смешивай с главными мыслями.
+3. transcript — максимально полная транскрипция всей разборчивой речи с нормальной пунктуацией. Не пересказывай вместо транскрипции. Исправляй очевидные ошибки распознавания, бренды и общеизвестные термины по контексту. Если уверенно различаешь спикеров, используй нейтральные метки «Ведущий:» / «Гость:»; не угадывай личности.
+4. Для длинного видео в transcript можно ставить редкие временные ориентиры при смене крупных тем.
+5. summary — 4–7 ясных предложений своими словами: о чём весь ролик, главные выводы и почему это важно.
+6. main_points — 5–12 разных содержательных тезисов, охватывающих весь ролик, без повторов.
+7. key_facts — конкретные цифры, названия, примеры, события и проверяемые утверждения, реально прозвучавшие в ролике. Если их нет — пустой список.
+8. actions — практические действия, решения или идеи, которые зритель действительно может применить. Если их нет — пустой список.
+9. visual_context — только значимые детали изображения: схемы, интерфейсы, графики, демонстрации и надписи, добавляющие смысл.
+10. claims_to_verify — спорные/проверяемые утверждения спикеров, которые разумно проверить внешними источниками. Не объявляй их истинными или ложными.
+11. chapters — ключевые смысловые разделы по всему ролику с приблизительными таймкодами MM:SS или HH:MM:SS. Для длинного ролика дай достаточно глав, чтобы покрыть весь материал.
+12. tags — 4–8 коротких тематических тегов без #.
+13. Все аналитические поля — на русском. transcript оставь на языке речи.
+14. Если часть аудио неразборчива, кратко пометь это, а не придумывай слова.
+15. Верни только данные по заданной JSON-схеме."""
 
 
 class GeminiError(RuntimeError):
@@ -77,8 +77,37 @@ def _headers():
 def _raise_for_response(response, context):
     if response.ok:
         return
-    body = (response.text or "")[-1600:]
+    body = (response.text or "")[-1800:]
     raise GeminiError(f"{context}: HTTP {response.status_code}: {body}")
+
+
+def _request_interaction(payload, context):
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{API_BASE}/interactions",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json=payload,
+                timeout=(30, GEMINI_REQUEST_TIMEOUT),
+            )
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+                wait = 4 * (attempt + 1)
+                print(f"{context}: transient HTTP {response.status_code}; retry in {wait}s", flush=True)
+                time.sleep(wait)
+                continue
+            _raise_for_response(response, context)
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= 2:
+                break
+            wait = 4 * (attempt + 1)
+            print(f"{context}: transient {type(exc).__name__}; retry in {wait}s", flush=True)
+            time.sleep(wait)
+        except Exception:
+            raise
+    raise GeminiError(f"{context}: network timeout after retries: {last_error}")
 
 
 def _upload_file(path):
@@ -95,7 +124,7 @@ def _upload_file(path):
         "X-Goog-Upload-Header-Content-Type": mime,
         "Content-Type": "application/json",
     }
-    response = requests.post(UPLOAD_URL, headers=headers, json={"file": {"display_name": path.name[:120]}}, timeout=(20, 40))
+    response = requests.post(UPLOAD_URL, headers=headers, json={"file": {"display_name": path.name[:120]}}, timeout=(20, 60))
     _raise_for_response(response, "Gemini: не удалось начать загрузку")
     upload_url = response.headers.get("x-goog-upload-url")
     if not upload_url:
@@ -197,7 +226,7 @@ def _validate_analysis(data, model):
         raise GeminiError("Gemini вернул не JSON-объект")
     summary = re.sub(r"\s+", " ", str(data.get("summary") or "")).strip()
     transcript = re.sub(r"[ \t]+", " ", str(data.get("transcript") or "")).strip()
-    if len(summary) < 30:
+    if len(summary) < 40:
         raise GeminiError("Gemini вернул слишком короткую выжимку")
     if len(transcript) < 10:
         transcript = "Разборчивой речи в ролике не обнаружено."
@@ -209,7 +238,7 @@ def _validate_analysis(data, model):
         title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
         if title:
             chapters.append({"time": t or "00:00", "title": title})
-        if len(chapters) >= 8:
+        if len(chapters) >= 20:
             break
     tags = []
     for raw in data.get("tags", []) if isinstance(data.get("tags"), list) else []:
@@ -222,11 +251,11 @@ def _validate_analysis(data, model):
         "engine": f"Gemini ({model})",
         "language": re.sub(r"\s+", " ", str(data.get("language") or "")).strip() or "не определён",
         "summary": summary,
-        "main_points": _clean_list(data.get("main_points"), 8),
-        "key_facts": _clean_list(data.get("key_facts"), 8),
-        "actions": _clean_list(data.get("actions"), 6),
-        "visual_context": _clean_list(data.get("visual_context"), 5),
-        "claims_to_verify": _clean_list(data.get("claims_to_verify"), 6),
+        "main_points": _clean_list(data.get("main_points"), 12),
+        "key_facts": _clean_list(data.get("key_facts"), 12),
+        "actions": _clean_list(data.get("actions"), 10),
+        "visual_context": _clean_list(data.get("visual_context"), 8),
+        "claims_to_verify": _clean_list(data.get("claims_to_verify"), 10),
         "chapters": chapters,
         "tags": tags,
         "transcript": transcript,
@@ -245,19 +274,12 @@ def _run_interaction(file_info, model, title, source_url, platform):
     payload = {
         "model": model,
         "input": [
-            {"type": "video", "uri": uri, "mime_type": mime},
+            {"type": "video", "uri": uri, "mime_type": mime, "resolution": "low"},
             {"type": "text", "text": PROMPT + context},
         ],
         "response_format": {"type": "text", "mime_type": "application/json", "schema": ANALYSIS_SCHEMA},
     }
-    response = requests.post(
-        f"{API_BASE}/interactions",
-        headers={**_headers(), "Content-Type": "application/json"},
-        json=payload,
-        timeout=(30, GEMINI_REQUEST_TIMEOUT),
-    )
-    _raise_for_response(response, f"Gemini model={model}")
-    raw = _extract_output_text(response.json())
+    raw = _extract_output_text(_request_interaction(payload, f"Gemini model={model}"))
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:

@@ -18,6 +18,7 @@ import requests
 import bot
 import youtube_compat
 from gemini_ai import format_analysis, is_configured
+from telegram_video_compat import prepare_telegram_mp4
 from youtube_direct import analyze_youtube_url
 
 
@@ -204,7 +205,8 @@ def _handle_youtube(message, url: str):
             return
 
         try:
-            source_video = bot.normalize_mp4(downloaded, tmpdir)
+            bot.edit(chat_id, status_id, "🎞 YouTube: проверяю совместимость видео с Telegram/iPhone…")
+            source_video = prepare_telegram_mp4(downloaded, tmpdir)
             source_duration = bot.media_duration(source_video)
         except Exception as exc:
             bot.edit(chat_id, status_id, f"❌ YouTube: MP4 скачан, но не подготовлен: {bot.clean_error(exc)}")

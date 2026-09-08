@@ -87,6 +87,12 @@ def prepare_telegram_mp4(path: str | Path, tmpdir: str | Path) -> Path:
     Safe H.264/AAC input is remuxed with clean timestamps and +faststart. Anything
     else is transcoded once to H.264 8-bit yuv420p + AAC, tagged avc1, then probed
     again before it can be sent to Telegram.
+
+    Railway containers can be memory-constrained. A default 1080p libx264 encode
+    can consume several hundred MB before the first frame is produced. Unsafe
+    sources therefore use a bounded-memory compatibility transcode: max long edge
+    1280 px, single encoder thread, superfast + zerolatency. Safe H.264 sources are
+    still remuxed without quality loss.
     """
     source = Path(path)
     tmpdir = Path(tmpdir)
@@ -128,15 +134,19 @@ def prepare_telegram_mp4(path: str | Path, tmpdir: str | Path) -> Path:
                 print(f"TELEGRAM_VIDEO_REMUX_VALIDATE_FAIL: {exc}", flush=True)
         else:
             error = (remux.stderr or "")[-1200:].replace("\n", " ")
-            print(f"TELEGRAM_VIDEO_REMUX_FAIL: {error}", flush=True)
+            print(f"TELEGRAM_VIDEO_REMUX_FAIL rc={remux.returncode}: {error}", flush=True)
 
     transcode = _run_ffmpeg(
         [
-            "ffmpeg", "-y", "-fflags", "+genpts", "-i", str(source),
+            "ffmpeg", "-y", "-fflags", "+genpts",
+            "-threads", "1", "-filter_threads", "1",
+            "-i", str(source),
             "-map", "0:v:0", "-map", "0:a:0?",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-vf",
+            "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
+            "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-crf", "22",
             "-profile:v", "high", "-level:v", "4.1", "-tag:v", "avc1",
+            "-threads:v", "1",
             "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
             "-movflags", "+faststart",
             "-avoid_negative_ts", "make_zero",
@@ -146,13 +156,17 @@ def prepare_telegram_mp4(path: str | Path, tmpdir: str | Path) -> Path:
         timeout=3600,
     )
     if transcode.returncode != 0:
-        error = (transcode.stderr or "")[-1600:].replace("\n", " ")
-        raise RuntimeError(f"Не удалось перекодировать видео для Telegram/iPhone: {error}")
+        error = (transcode.stderr or "")[-2200:].replace("\n", " ")
+        raise RuntimeError(
+            "Не удалось перекодировать видео для Telegram/iPhone "
+            f"(ffmpeg rc={transcode.returncode}): {error}"
+        )
 
     info = _validate_output(output)
     print(
         "TELEGRAM_VIDEO_READY mode=transcode "
-        f"codec={info['video_codec']} pix_fmt={info['pixel_format']} audio={info['audio_codec'] or 'none'}",
+        f"codec={info['video_codec']} pix_fmt={info['pixel_format']} audio={info['audio_codec'] or 'none'} "
+        f"size={info['width']}x{info['height']}",
         flush=True,
     )
     return output

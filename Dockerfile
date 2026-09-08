@@ -38,10 +38,13 @@ COPY --from=whisper-builder /models /opt/models
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py bot_runner.py youtube_compat.py youtube_direct.py youtube_resilient_runner.py local_ai.py gemini_ai.py sitecustomize.py ./
+COPY bot.py bot_runner.py youtube_compat.py youtube_direct.py youtube_resilient_runner.py telegram_video_compat.py local_ai.py gemini_ai.py sitecustomize.py ./
 COPY yt_dlp_plugins ./yt_dlp_plugins
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh \
+    && python -m py_compile \
+       bot.py bot_runner.py youtube_compat.py youtube_direct.py youtube_resilient_runner.py \
+       telegram_video_compat.py local_ai.py gemini_ai.py sitecustomize.py
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium

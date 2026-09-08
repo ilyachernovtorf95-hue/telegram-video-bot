@@ -44,7 +44,8 @@ COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh \
     && python -m py_compile \
        bot.py bot_runner.py youtube_compat.py youtube_direct.py youtube_resilient_runner.py \
-       telegram_video_compat.py local_ai.py gemini_ai.py sitecustomize.py
+       telegram_video_compat.py local_ai.py gemini_ai.py sitecustomize.py \
+    && TELEGRAM_BOT_TOKEN='1:build-smoke' python -c "import telegram_video_compat, youtube_resilient_runner; print('startup imports OK')"
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_PATH=/usr/bin/chromium

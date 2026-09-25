@@ -96,7 +96,7 @@ def _emit_analysis(chat_id, tmpdir, title, url, result):
 def _send_local_file_route(chat_id):
     bot.send(
         chat_id,
-        "📱 AI-разбор уже выполнен, но YouTube не отдал MP4 серверному IP Railway. "
+        "📱 AI-разбор уже выполнен, но YouTube не отдал MP4 серверному IP. "
         "Бесплатный резерв для самого файла на iPhone:\n\n"
         f"a-Shell mini: {ASHELL_MINI_URL}\n"
         f"SW-DLT: {SW_DLT_URL}\n\n"

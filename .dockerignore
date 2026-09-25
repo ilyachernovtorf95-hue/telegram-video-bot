@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+__pycache__/
+*.pyc
+.venv/
+upload/
+project_sources/
+candidate_*
+

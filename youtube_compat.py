@@ -1,4 +1,4 @@
-"""YouTube reliability layer for Railway.
+"""YouTube reliability layer for a cloud server.
 
 Goals:
 - keep Telegram polling lightweight and responsive;
@@ -7,7 +7,7 @@ Goals:
 - start the bgutil PO-token helper only while a YouTube job is running;
 - optionally use user-supplied YouTube cookies and/or a proxy without storing secrets in git.
 
-Optional Railway variables:
+Optional environment variables:
 - YOUTUBE_COOKIES_B64: base64 of a Netscape-format cookies.txt file
 - YOUTUBE_COOKIES: raw Netscape-format cookies.txt text (multiline)
 - YOUTUBE_USER_AGENT: browser User-Agent matching the cookie session
@@ -137,7 +137,7 @@ def _clear_tmp(tmpdir):
 def _youtube_opts(tmpdir, client: str, *, authenticated: bool):
     opts = _ORIGINAL_YTDLP_OPTS(tmpdir, client)
 
-    # Railway egress may expose IPv6 and cloud-host paths that YouTube rejects.
+    # Cloud egress may expose IPv6 and network paths that YouTube rejects.
     # Binding to 0.0.0.0 is yt-dlp's programmatic equivalent of --force-ipv4.
     opts["source_address"] = "0.0.0.0"
     opts["sleep_interval_requests"] = 1.0
@@ -226,15 +226,15 @@ def _download_youtube(url, tmpdir):
     if _is_auth_or_ip_block(errors):
         if not YOUTUBE_COOKIEFILE and not YOUTUBE_PROXY:
             raise RuntimeError(
-                "YouTube заблокировал запросы с IP Railway (проверка «не бот»/HTTP 403). "
+                "YouTube заблокировал запросы с IP сервера (проверка «не бот»/HTTP 403). "
                 "Бот уже попробовал несколько клиентов, IPv4 и PO-token fallback. "
-                "Для стабильной загрузки нужен один бесплатный шаг: добавить в Railway "
+                "Для стабильной загрузки попробуй добавить в .env на сервере "
                 "YOUTUBE_COOKIES_B64 (cookies.txt из отдельной YouTube-сессии). "
                 "Код уже готов принять эти cookies; присылать их в чат не нужно."
             )
         if YOUTUBE_COOKIEFILE and not YOUTUBE_PROXY:
             raise RuntimeError(
-                "YouTube продолжил блокировать Railway даже с cookies. Это ограничение IP дата-центра. "
+                "YouTube продолжил блокировать IP сервера даже с cookies. Это ограничение IP дата-центра. "
                 "Следующий резерв — YOUTUBE_PROXY через доверенный residential/ISP IP. "
                 "Остальные платформы и сам Telegram-бот продолжают работать."
             )

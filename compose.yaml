@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: video-knowledge-bot:oci-arm64
+    image: video-knowledge-bot:arm64
     platform: linux/arm64
     env_file:
       - .env
@@ -15,4 +15,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-

@@ -9,14 +9,15 @@ PROJECT_NAME="${RAILWAY_PROJECT_NAME:-}"
 
 # Fail closed on every known non-primary Railway deployment. This guard lives in
 # ENTRYPOINT so it still applies even if Railway has an old/custom Start Command.
+# A standby exits successfully instead of consuming resources indefinitely.
 if [ -n "$PROJECT_ID" ]; then
   if [ "$PROJECT_ID" != "$PRIMARY_PROJECT_ID" ]; then
     echo "STANDBY: Telegram polling disabled for Railway project ${PROJECT_NAME:-unknown} ($PROJECT_ID)"
-    exec tail -f /dev/null
+    exit 0
   fi
 elif [ -n "$PROJECT_NAME" ] && [ "$PROJECT_NAME" != "$PRIMARY_PROJECT_NAME" ]; then
   echo "STANDBY: Telegram polling disabled for Railway project $PROJECT_NAME (project ID unavailable)"
-  exec tail -f /dev/null
+  exit 0
 fi
 
 echo "PRIMARY: starting responsive Telegram bot with resilient YouTube path in ${PROJECT_NAME:-local} (${PROJECT_ID:-no-project-id})"
